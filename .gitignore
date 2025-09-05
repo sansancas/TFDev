@@ -208,3 +208,10 @@ __marimo__/
 
 #TFRecords
 *.tfrecord
+
+#Keras
+*.keras
+*.h5
+
+#runs
+runs/
