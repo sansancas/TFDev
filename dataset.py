@@ -1,4 +1,5 @@
 import os
+import gc
 import glob
 import numpy as np
 import tensorflow as tf
@@ -366,6 +367,7 @@ def create_dataset_final(tfrecord_files, n_channels, n_timepoints, batch_size,
             lambda: tf.pad(eeg_flat, [[0, expected_eeg_size - eeg_size]])
         )
         eeg = tf.reshape(eeg_flat, [n_channels, n_timepoints])
+        eeg = tf.transpose(eeg, [1, 0])  # Convert from (channels, time) to (time, channels)
         
         # Labels - versión simplificada sin tf.cond problemático
         labels_flat = tf.sparse.to_dense(parsed['labels'])
@@ -417,7 +419,7 @@ def create_dataset_final(tfrecord_files, n_channels, n_timepoints, batch_size,
 # 🎯 PIPELINE DEFINITIVO CON FUNCIÓN CORREGIDA
 # =================================================================================================================
 
-def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_size_mb, dataset_type):
+def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_size_mb, dataset_type, resample_fs=256, window_sec=10.0, hop_sec=5.0):
     """
     ✅ VERSIÓN DEFINITIVAMENTE CORREGIDA
     ✅ NO MÁS ERRORES DE serialize_example
@@ -505,7 +507,7 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
         
         # ===== PROCESAR EDF =====
         try:
-            result = extract_montage_signals(str(edf_path), montage='ar', desired_fs=0)
+            result = extract_montage_signals(str(edf_path), montage='ar', desired_fs=resample_fs)
             
             if result is None:
                 return {
@@ -537,7 +539,7 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                         'windows_created': 0,
                         'tfrecord_files': []
                     }
-                sfreq = 256
+                sfreq = resample_fs  # Usar la frecuencia objetivo
             else:
                 return {
                     'success': False,
@@ -608,14 +610,19 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                 'tfrecord_files': []
             }
         
-        # ===== CREAR VENTANAS =====
+        # ===== CREAR VENTANAS CON CONFIGURACIÓN MEJORADA =====
         try:
-            window_size_sec = 1.0
-            window_samples = int(window_size_sec * sfreq)
-            overlap = 0.5
-            step_samples = int(window_samples * (1 - overlap))
+            # Usar parámetros configurables como en pipeline.py
+            window_samples = int(round(window_sec * sfreq))
+            if hop_sec is None or hop_sec <= 0:
+                step_samples = window_samples  # Sin solapamiento
+            else:
+                step_samples = int(round(hop_sec * sfreq))
+                # Validación como en pipeline.py
+                step_samples = max(1, min(step_samples, window_samples))
             
             if n_samples < window_samples:
+                # Fallback para archivos cortos
                 window_samples = min(n_samples, int(0.5 * sfreq))
                 step_samples = window_samples // 2
                 
@@ -628,33 +635,40 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                         'tfrecord_files': []
                     }
             
+            # Convertir etiquetas a índices de muestra para mayor precisión
+            seizure_intervals_samples = []
+            for _, row in labels_df.iterrows():
+                if 'start_time' in row and 'stop_time' in row:
+                    try:
+                        s_time = float(row['start_time'])
+                        e_time = float(row['stop_time'])
+                        s_idx = max(0, int(round(s_time * sfreq)))
+                        e_idx = min(n_samples, int(round(e_time * sfreq)))
+                        if e_idx > s_idx:
+                            seizure_intervals_samples.append((s_idx, e_idx))
+                    except (ValueError, TypeError):
+                        continue
+            
             windows_data = []
             windows_labels = []
             
+            # Generación mejorada como en pipeline.py
             for start_sample in range(0, n_samples - window_samples + 1, step_samples):
                 end_sample = start_sample + window_samples
                 
                 window_signal = signal_data[:, start_sample:end_sample]
                 
-                start_time = start_sample / sfreq
-                end_time = end_sample / sfreq
-                
-                window_label = 0.0
-                
-                for _, row in labels_df.iterrows():
-                    if 'start_time' in row and 'stop_time' in row:
-                        try:
-                            label_start = float(row['start_time'])
-                            label_end = float(row['stop_time'])
-                            
-                            if not (end_time <= label_start or start_time >= label_end):
-                                window_label = float(row['probability_label'])
-                                break
-                        except (ValueError, TypeError):
-                            continue
+                # Etiquetas frame-level más precisas
+                labels_frame = np.zeros(window_samples, dtype=np.int64)
+                for s_idx, e_idx in seizure_intervals_samples:
+                    # Coordenadas locales de la ventana
+                    rs = max(0, s_idx - start_sample)
+                    re = min(window_samples, e_idx - start_sample)
+                    if re > rs:
+                        labels_frame[rs:re] = 1
                 
                 windows_data.append(window_signal)
-                windows_labels.append(window_label)
+                windows_labels.append(labels_frame)
             
             if not windows_data:
                 return {
@@ -684,7 +698,7 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
             serialize_errors = 0
             
             with tf.io.TFRecordWriter(str(tfrecord_path)) as writer:
-                for i, (window_signal, window_label) in enumerate(zip(windows_data, windows_labels)):
+                for i, (window_signal, window_labels_array) in enumerate(zip(windows_data, windows_labels)):
                     if window_signal.shape[1] != window_samples:
                         continue
                     
@@ -695,7 +709,7 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                     try:
                         # Preparar datos en el formato que espera serialize_example
                         eeg_flat = window_signal.astype(np.float32).flatten()
-                        labels_flat = np.array([int(window_label > 0.5)], dtype=np.int64)
+                        labels_flat = window_labels_array.astype(np.int64).flatten()
                         
                         # Llamada con la signature EXACTA de tu función
                         example_bytes = serialize_example(
@@ -703,7 +717,7 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                             labels_flat,                                 # Segundo parámetro posicional
                             patient_id=base_name.split('_')[0],         # Keyword argument requerido
                             record_id=base_name,                        # Keyword argument requerido
-                            duration_sec=float(window_size_sec),        # Keyword argument requerido
+                            duration_sec=float(window_sec),             # Keyword argument requerido
                             n_channels=int(window_signal.shape[0]),     # Opcional
                             n_timepoints=int(window_signal.shape[1]),   # Opcional
                             sfreq=float(sfreq),                         # Opcional
@@ -722,7 +736,9 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                         # Fallback manual SOLO si falla serialize_example
                         try:
                             eeg_flat_fallback = window_signal.astype(np.float32).flatten()
-                            labels_flat_fallback = np.array([int(window_label > 0.5)], dtype=np.int64)
+                            # Para fallback, usar etiqueta de ventana simplificada
+                            window_label_simple = int(np.any(window_labels_array > 0.5))
+                            labels_flat_fallback = np.array([window_label_simple], dtype=np.int64)
                             
                             feature = {
                                 'eeg': tf.train.Feature(
@@ -738,7 +754,7 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                                     bytes_list=tf.train.BytesList(value=[base_name.encode('utf-8')])
                                 ),
                                 'duration_sec': tf.train.Feature(
-                                    float_list=tf.train.FloatList(value=[float(window_size_sec)])
+                                    float_list=tf.train.FloatList(value=[float(window_sec)])
                                 )
                             }
                             
@@ -793,6 +809,9 @@ def write_tfrecord_splits_FINAL_CORRECTED(
     data_dir,
     tfrecord_dir,
     montage='ar',
+    resample_fs=256,
+    window_sec=10.0,
+    hop_sec=5.0,
     limits=None,
     n_workers=None,
     chunk_size_mb=100,
@@ -804,6 +823,9 @@ def write_tfrecord_splits_FINAL_CORRECTED(
     ✅ USA process_single_file_FINAL_CORRECTED
     ✅ MONITOREA ERRORES DE SERIALIZACIÓN
     ✅ EFICIENCIA MANTENIDA
+    ✅ LÍMITES CORREGIDOS
+    ✅ CONFIGURACIÓN MEJORADA: resample_fs, window_sec, hop_sec
+    ✅ ETIQUETAS FRAME-LEVEL PRECISAS
     """
     from concurrent.futures import ProcessPoolExecutor, as_completed
     from pathlib import Path
@@ -814,6 +836,10 @@ def write_tfrecord_splits_FINAL_CORRECTED(
     
     print(f"🎯 PIPELINE DEFINITIVO CORREGIDO: {tfrecord_dir}")
     print(f"   Montaje: {montage}, Chunk: {chunk_size_mb}MB")
+    
+    # ✅ ARREGLAR: Mostrar límites si se especifican
+    if limits:
+        print(f"   Límites por split: {limits}")
     
     if n_workers is None:
         n_workers = 1
@@ -830,26 +856,50 @@ def write_tfrecord_splits_FINAL_CORRECTED(
         'errors': 0,
         'tfrecord_files_created': 0,
         'processing_time': 0,
-        'serialize_errors': 0  # ✅ Nuevo: monitoreo de errores de serialización
+        'serialize_errors': 0
     }
     
     for split, tfrecord_split in split_mapping.items():
-        print(f"\\n📁 Procesando split '{split}' → {tfrecord_split}")
+        print(f"\n📁 Procesando split '{split}' → {tfrecord_split}")
         
         try:
             csv_files = list_bi_csvs(data_dir, split, montage)
             
+            print(f"   📊 {len(csv_files)} archivos encontrados inicialmente")
+            
+            # ✅ ARREGLAR: Aplicar límites CORRECTAMENTE
             if limits and split in limits:
+                original_count = len(csv_files)
                 csv_files = csv_files[:limits[split]]
+                print(f"   🔒 Límite aplicado: {original_count} → {len(csv_files)} archivos (límite: {limits[split]})")
             
             if not csv_files:
-                print(f"   ⚠️  Sin archivos para {split}")
+                print(f"   ⚠️  Sin archivos para procesar en {split}")
                 continue
-            
-            print(f"   📊 {len(csv_files)} archivos encontrados")
             
             split_output_dir = tfrecord_path / tfrecord_split
             split_output_dir.mkdir(exist_ok=True, parents=True)
+            
+            # ✅ ARREGLAR: Verificar si ya existen archivos procesados
+            if resume:
+                existing_tfrecords = list(split_output_dir.glob('*.tfrecord'))
+                if existing_tfrecords:
+                    print(f"   📋 Resume activado: {len(existing_tfrecords)} TFRecords ya existen")
+                    # Filtrar archivos ya procesados
+                    existing_bases = {f.stem for f in existing_tfrecords}
+                    csv_files_filtered = []
+                    for csv_file in csv_files:
+                        csv_stem = Path(csv_file).stem.replace('_bi', '')
+                        if csv_stem not in existing_bases:
+                            csv_files_filtered.append(csv_file)
+                    
+                    skipped = len(csv_files) - len(csv_files_filtered)
+                    csv_files = csv_files_filtered
+                    print(f"   ⏭️  {skipped} archivos ya procesados, {len(csv_files)} por procesar")
+            
+            if not csv_files:
+                print(f"   ✅ Todos los archivos ya están procesados en {split}")
+                continue
             
             split_stats = {
                 'files_processed': 0, 
@@ -860,7 +910,7 @@ def write_tfrecord_splits_FINAL_CORRECTED(
             }
             
             process_args = [
-                (str(f), str(split_output_dir), chunk_size_mb, tfrecord_split) 
+                (str(f), str(split_output_dir), chunk_size_mb, tfrecord_split, resample_fs, window_sec, hop_sec) 
                 for f in csv_files
             ]
             

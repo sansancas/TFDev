@@ -1,88 +1,23 @@
 import tensorflow as tf
 from tensorflow.keras import layers, models
-import numpy as np
 
-# ====================================================================================
-# TCN OPTIMIZADA PARA DETECCIÓN DE CONVULSIONES EEG - TENSORFLOW/KERAS
-# ====================================================================================
-
-class CausalConv1D(layers.Layer):
-    """Convolución causal mejorada con padding adaptativo"""
+class CausalPadding1D(layers.Layer):
+    """Capa de padding causal compatible con Keras Functional API"""
     
-    def __init__(self, filters, kernel_size, dilation_rate=1, use_bias=True, **kwargs):
+    def __init__(self, padding_size, **kwargs):
         super().__init__(**kwargs)
-        self.filters = filters
-        self.kernel_size = kernel_size
-        self.dilation_rate = dilation_rate
-        self.use_bias = use_bias
-        self.pad = (kernel_size - 1) * dilation_rate
-        
-        self.conv = layers.Conv1D(
-            filters=filters,
-            kernel_size=kernel_size,
-            dilation_rate=dilation_rate,
-            padding='valid',
-            use_bias=use_bias,
-            kernel_initializer='he_normal'
-        )
+        self.padding_size = padding_size
     
     def call(self, x):
-        # Padding causal manual
-        x = tf.pad(x, [[0, 0], [self.pad, 0], [0, 0]])
-        return self.conv(x)
-
-class SeparableConv1D(layers.Layer):
-    """SeparableConv1D optimizada para EEG con mejor eficiencia"""
+        return tf.pad(x, [[0, 0], [self.padding_size, 0], [0, 0]])
     
-    def __init__(self, filters, kernel_size, dilation_rate=1, use_bias=False, 
-                 depth_multiplier=1, **kwargs):
-        super().__init__(**kwargs)
-        self.filters = filters
-        self.kernel_size = kernel_size
-        self.dilation_rate = dilation_rate
-        self.use_bias = use_bias
-        self.depth_multiplier = depth_multiplier
-        self.pad = dilation_rate * (kernel_size - 1)
-        
-        # Depthwise convolution
-        self.depthwise = layers.DepthwiseConv1D(
-            kernel_size=kernel_size,
-            depth_multiplier=depth_multiplier,
-            dilation_rate=dilation_rate,
-            padding='valid',
-            use_bias=use_bias,
-            depthwise_initializer='he_normal'
-        )
-        
-        # Pointwise convolution
-        self.pointwise = layers.Conv1D(
-            filters=filters,
-            kernel_size=1,
-            use_bias=use_bias,
-            kernel_initializer='he_normal'
-        )
-        
-        # BatchNorm para estabilidad en EEG
-        self.bn_dw = layers.BatchNormalization()
-        self.bn_pw = layers.BatchNormalization()
-    
-    def call(self, x, training=None):
-        # Padding causal
-        x = tf.pad(x, [[0, 0], [self.pad, 0], [0, 0]])
-        
-        # Depthwise convolution
-        x = self.depthwise(x)
-        x = self.bn_dw(x, training=training)
-        x = tf.nn.relu(x)
-        
-        # Pointwise convolution
-        x = self.pointwise(x)
-        x = self.bn_pw(x, training=training)
-        
-        return x
+    def get_config(self):
+        config = super().get_config()
+        config.update({'padding_size': self.padding_size})
+        return config
 
 class SqueezeExcitation1D(layers.Layer):
-    """Squeeze-and-Excitation optimizado para señales EEG"""
+    """Squeeze-and-Excitation ligero compatible con XLA/JIT"""
     
     def __init__(self, channels, se_ratio=16, **kwargs):
         super().__init__(**kwargs)
@@ -91,266 +26,281 @@ class SqueezeExcitation1D(layers.Layer):
         self.hidden = max(1, channels // se_ratio)
         
         self.pool = layers.GlobalAveragePooling1D()
-        self.fc1 = layers.Dense(self.hidden, activation='relu')
-        self.fc2 = layers.Dense(channels, activation='sigmoid')
-        self.dropout = layers.Dropout(0.1)
+        self.fc1 = layers.Dense(self.hidden, activation='relu', use_bias=False)
+        self.fc2 = layers.Dense(channels, activation='sigmoid', use_bias=False)
         self.reshape = layers.Reshape((1, channels))
-        self.multiply = layers.Multiply()
     
-    def call(self, x, training=None):
+    def call(self, x):
         # Squeeze
         s = self.pool(x)
-        
         # Excitation
         s = self.fc1(s)
-        s = self.dropout(s, training=training)
         s = self.fc2(s)
         s = self.reshape(s)
-        
         # Scale
-        return self.multiply([x, s])
-
-class EnhancedTCNBlock(layers.Layer):
-    """Bloque TCN mejorado para detección de convulsiones EEG"""
+        return tf.multiply(x, s)
     
-    def __init__(self, channels, kernel_size, dilation_rate, dropout=0.25,
-                 separable=True, use_se=True, use_residual_scaling=True, **kwargs):
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            'channels': self.channels,
+            'se_ratio': self.se_ratio
+        })
+        return config
+
+class TemporalAlignment(layers.Layer):
+    """Capa para alinear temporalmente tensores en conexiones residuales"""
+    
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.channels = channels
-        self.kernel_size = kernel_size
-        self.dilation_rate = dilation_rate
-        self.dropout = dropout
-        self.separable = separable
-        self.use_se = use_se
-        self.use_residual_scaling = use_residual_scaling
-        
-        # Capas convolutivas
-        if separable:
-            self.conv1 = SeparableConv1D(channels, kernel_size, dilation_rate, use_bias=False)
-            self.conv2 = SeparableConv1D(channels, kernel_size, dilation_rate, use_bias=False)
-        else:
-            self.conv1 = CausalConv1D(channels, kernel_size, dilation_rate, use_bias=False)
-            self.conv2 = CausalConv1D(channels, kernel_size, dilation_rate, use_bias=False)
-        
-        # Normalización y dropout
-        self.ln1 = layers.LayerNormalization()
-        self.ln2 = layers.LayerNormalization()
-        self.drop1 = layers.Dropout(dropout)
-        self.drop2 = layers.Dropout(dropout)
-        
-        # Squeeze-and-Excitation
-        if use_se:
-            self.se = SqueezeExcitation1D(channels)
-        
-        # Residual scaling
-        if use_residual_scaling:
-            self.residual_scale = self.add_weight(
-                name='residual_scale',
-                shape=(1,),
-                initializer='zeros',
-                trainable=True
-            )
-            # Inicializar con 0.1
-            self.residual_scale.assign([0.1])
-        
-        # Projection layer para dilataciones altas
-        self.projection = None
-        if dilation_rate > 4:
-            self.projection = layers.Conv1D(channels, 1, use_bias=False, kernel_initializer='he_normal')
     
-    def call(self, x, training=None):
-        residual = x
+    def call(self, inputs):
+        x, residual = inputs
+        # Obtener la longitud mínima
+        x_len = tf.shape(x)[1]
+        res_len = tf.shape(residual)[1]
+        min_len = tf.minimum(x_len, res_len)
         
-        # Primera convolución
-        x = self.conv1(x, training=training) if self.separable else self.conv1(x)
-        x = self.ln1(x, training=training)
-        x = tf.keras.activations.gelu(x)  # GELU en lugar de ReLU
-        x = self.drop1(x, training=training)
+        # Recortar a la longitud mínima
+        x_aligned = x[:, :min_len, :]
+        res_aligned = residual[:, :min_len, :]
         
-        # Segunda convolución
-        x = self.conv2(x, training=training) if self.separable else self.conv2(x)
-        x = self.ln2(x, training=training)
-        x = tf.keras.activations.gelu(x)
-        x = self.drop2(x, training=training)
-        
-        # Squeeze-and-Excitation
-        if self.use_se:
-            x = self.se(x, training=training)
-        
-        # Ajustar longitudes para residual connection
-        if x.shape[1] != residual.shape[1]:
-            T = min(x.shape[1], residual.shape[1])
-            x = x[:, :T, :]
-            residual = residual[:, :T, :]
-        
-        # Proyección del residual si es necesario
-        if self.projection is not None:
-            residual = self.projection(residual)
-        
-        # Conexión residual con escalado
-        if self.use_residual_scaling:
-            return residual + self.residual_scale * x
-        else:
-            return residual + x
+        return x_aligned, res_aligned
 
-def build_optimized_seizure_tcn(input_dim=22,
-                               num_classes=2,
-                               num_filters=96,
-                               kernel_size=7,
-                               num_blocks=8,
-                               time_step=True,
-                               one_hot=True,
-                               separable=True,
-                               dropout=0.3,
-                               use_se=True,
-                               use_residual_scaling=True,
-                               use_adaptive_dilation=True,
-                               use_multiscale=True,
-                               class_weights=None):
-    """
-    TCN optimizada específicamente para detección de convulsiones EEG
-    ✅ FIXED: Maneja correctamente one_hot y binary modes
-    """
+def build_tcn(input_shape,
+              num_classes=2,
+              num_filters=68,
+              kernel_size=7,
+              dropout_rate=0.25,
+              num_blocks=8,
+              time_step=True,
+              one_hot=True,
+              hpc=False,
+              separable=True,
+              use_squeeze_excitation=False,
+              use_gelu=True):
     
-    # Input layer
-    inputs = layers.Input(shape=(None, input_dim), name='input')
+    # define the input layer
+    dtype = 'float32' if hpc else None
+    inputs = layers.Input(shape=input_shape, dtype=dtype)
     x = inputs
-    
-    # Proyección de entrada mejorada con normalización
-    x = layers.Dense(num_filters, kernel_initializer='he_normal', name='in_fc')(x)
-    x = layers.LayerNormalization(name='in_ln')(x)
-    x = layers.Activation('gelu', name='in_gelu')(x)
-    x = layers.Dropout(0.1, name='in_dropout')(x)
-    
-    # Bloques TCN con dilataciones adaptativas
-    if use_adaptive_dilation:
-        # Dilataciones que crecen más lentamente para mejor captura temporal
-        dilations = [2**min(i, 6) for i in range(num_blocks)]  # Cap at 64
-    else:
-        dilations = [2**i for i in range(num_blocks)]
-    
-    for i, dilation in enumerate(dilations):
-        x = EnhancedTCNBlock(
-            channels=num_filters,
-            kernel_size=kernel_size,
-            dilation_rate=dilation,
-            dropout=dropout,
-            separable=separable,
-            use_se=use_se,
-            use_residual_scaling=use_residual_scaling,
-            name=f'tcn_block_{i+1}'
-        )(x)
-    
-    # Características multi-escala opcionales
-    if use_multiscale:
-        # Diferentes escalas temporales
-        multiscale_features = []
-        for k in [3, 5, 7, 11]:
-            ms_feat = layers.Conv1D(
-                num_filters//4, 
-                kernel_size=k, 
-                padding='same',
-                activation='relu',
-                name=f'multiscale_conv_{k}'
-            )(x)
-            multiscale_features.append(ms_feat)
+
+    # Activación a usar
+    activation = 'gelu' if use_gelu else 'relu'
+
+    # build TCN blocks
+    for i in range(num_blocks):
+        dilation = 2 ** i
+        residual = x
+
+        # first causal conv + norm + dropout
+        if separable:
+            # Padding causal manual para SeparableConv1D usando capa personalizada
+            pad_len = dilation * (kernel_size - 1)
+            x = CausalPadding1D(pad_len, name=f"pad1_block{i+1}")(x)
+            x = layers.SeparableConv1D(filters=num_filters,
+                                       kernel_size=kernel_size,
+                                       dilation_rate=dilation,
+                                       padding='valid',  # Cambiado de 'same' a 'valid'
+                                       depth_multiplier=1,
+                                       use_bias=False,
+                                       depthwise_initializer='he_normal',
+                                       pointwise_initializer='he_normal',
+                                       name=f"sepconv1_block{i+1}")(x)
+        else:
+            x = layers.Conv1D(filters=num_filters,
+                          kernel_size=kernel_size,
+                          dilation_rate=dilation,
+                          padding='causal',
+                          kernel_initializer='he_normal',
+                          use_bias=False,
+                          name=f"conv2_block{i+1}")(x)
+        x = layers.LayerNormalization(name=f"ln1_block{i+1}")(x)
+        x = layers.SpatialDropout1D(rate=dropout_rate,
+                                    name=f"drop1_block{i+1}")(x)
+
+        # second causal conv + norm + activation + dropout
+        if separable:
+            # Padding causal manual para SeparableConv1D usando capa personalizada
+            pad_len = dilation * (kernel_size - 1)
+            x = CausalPadding1D(pad_len, name=f"pad2_block{i+1}")(x)
+            x = layers.SeparableConv1D(filters=num_filters,
+                                       kernel_size=kernel_size,
+                                       dilation_rate=dilation,
+                                       padding='valid',  # Cambiado de 'same' a 'valid'
+                                       depth_multiplier=1,
+                                       use_bias=False,
+                                       depthwise_initializer='he_normal',
+                                       pointwise_initializer='he_normal',
+                                       name=f"sepconv2_block{i+1}")(x)
+        else:
+            x = layers.Conv1D(filters=num_filters,
+                          kernel_size=kernel_size,
+                          dilation_rate=dilation,
+                          padding='causal',
+                          kernel_initializer='he_normal',
+                          use_bias=False,
+                          name=f"conv1_block{i+1}")(x)
         
-        # Concatenar y fusionar
-        ms_concat = layers.Concatenate(axis=-1, name='multiscale_concat')(multiscale_features)
-        ms_fused = layers.Conv1D(num_filters, 1, name='multiscale_fusion')(ms_concat)
-        x = layers.Add(name='multiscale_residual')([x, ms_fused])
-    
-    # ✅ FIXED: Cabeza de clasificación que maneja correctamente ambos modos
+        x = layers.LayerNormalization(name=f"ln2_block{i+1}")(x)
+        x = layers.Activation(activation, name=f"{activation}_block{i+1}")(x)
+        x = layers.SpatialDropout1D(rate=dropout_rate,
+                                    name=f"drop2_block{i+1}")(x)
+
+        # Squeeze-and-Excitation opcional
+        if use_squeeze_excitation:
+            x = SqueezeExcitation1D(num_filters, name=f"se_block{i+1}")(x)
+
+        # skip connection con ajuste de longitud temporal
+        if i == 0:
+            if separable:
+                skip = layers.SeparableConv1D(filters=num_filters,
+                                              kernel_size=1,
+                                              padding='same',
+                                              depth_multiplier=1,
+                                              use_bias=False,
+                                              depthwise_initializer='he_normal',
+                                              pointwise_initializer='he_normal',
+                                              name="sepconv_skip")(residual)
+            else:
+                skip = layers.Conv1D(filters=num_filters,
+                                 kernel_size=1,
+                                 padding='same',
+                                 kernel_initializer='he_normal',
+                                 use_bias=False,
+                                 name="conv_skip")(residual)
+        else:
+            skip = residual
+        
+        # Ajustar longitudes para conexión residual usando capa personalizada
+        x_aligned, skip_aligned = TemporalAlignment(name=f"align_block{i+1}")([x, skip])
+        x = layers.Add(name=f"add_block{i+1}")([x_aligned, skip_aligned])
+
+    # classification head
     if time_step:
-        # Predicción frame-by-frame
-        x = layers.Dense(num_filters//2, kernel_initializer='he_normal', name='head_dense1')(x)
-        x = layers.LayerNormalization(name='head_ln')(x)
-        x = layers.Activation('gelu', name='head_gelu')(x)
-        x = layers.Dropout(dropout, name='head_dropout')(x)
-        
-        # ✅ CRITICAL FIX: Output shape basado en el modo
+        # Frame-by-frame classification
+        x = layers.Dense(units=num_classes,
+                         kernel_initializer='he_normal',
+                         use_bias=False,
+                         name="fc")(x)
         if one_hot:
-            # One-hot: output (batch, time, 2) para 2 clases
-            x = layers.Dense(num_classes, kernel_initializer='he_normal', name='head_output')(x)
-            outputs = layers.Softmax(name='softmax')(x)
+            outputs = layers.Softmax(name="softmax")(x)
         else:
-            # Binary: output (batch, time, 1) para clasificación binaria
-            outputs = layers.Dense(1, activation='sigmoid', name='head_output')(x)
+            # Para clasificación binaria en modo time_step
+            outputs = layers.Dense(1, activation='sigmoid', 
+                                 kernel_initializer='he_normal',
+                                 name='output')(x)
     else:
-        # ✅ FIXED: Predicción por ventana - NO TEMPORAL
-        x_avg = layers.GlobalAveragePooling1D(name='gap')(x)
-        x_max = layers.GlobalMaxPooling1D(name='gmp')(x)
-        x_combined = layers.Concatenate(name='pool_concat')([x_avg, x_max])
-        
-        x_combined = layers.Dense(num_filters, kernel_initializer='he_normal', name='head_dense1')(x_combined)
-        x_combined = layers.LayerNormalization(name='head_ln')(x_combined)
-        x_combined = layers.Activation('gelu', name='head_gelu')(x_combined)
-        x_combined = layers.Dropout(dropout, name='head_dropout')(x_combined)
-        
-        # ✅ CRITICAL FIX: Output shape basado en el modo - NO TEMPORAL
+        # Window-level classification
+        x = layers.GlobalAveragePooling1D(name="gap")(x)
+        x = layers.Dense(units=num_classes,
+                         kernel_initializer='he_normal',
+                         use_bias=False,
+                         name="fc")(x)
         if one_hot:
-            # One-hot: output (batch, 2) para 2 clases
-            x_combined = layers.Dense(num_classes, kernel_initializer='he_normal', name='head_dense2')(x_combined)
-            outputs = layers.Softmax(name='softmax')(x_combined)
+            outputs = layers.Softmax(name="softmax")(x)
         else:
-            # Binary: output (batch, 1) para clasificación binaria
-            outputs = layers.Dense(1, activation='sigmoid', name='head_output')(x_combined)
+            # Para clasificación binaria en modo window
+            outputs = layers.Dense(1, activation='sigmoid',
+                                 kernel_initializer='he_normal', 
+                                 name='output')(x)
     
-    # Crear modelo
-    model = models.Model(inputs=inputs, outputs=outputs, name='optimized_seizure_tcn')
+    model = models.Model(inputs=inputs, outputs=outputs, name="tcn_eegnet")
     
-    # Información del modelo
+    # Calcular y mostrar información del modelo incluyendo campo receptivo
     total_params = model.count_params()
-    receptive_field = calculate_receptive_field(num_blocks, kernel_size, use_adaptive_dilation)
+    receptive_field = calculate_receptive_field(num_blocks, kernel_size)
     
-    print(f"🧠 OptimizedSeizureTCN (TensorFlow) creada:")
+    print(f"🧠 TCN Enhanced creada:")
     print(f"├── Parámetros totales: {total_params:,}")
-    print(f"├── Campo receptivo: {receptive_field} muestras ({receptive_field/256:.2f}s)")
-    print(f"├── Canales entrada: {input_dim}")
+    print(f"├── Campo receptivo: {receptive_field} muestras ({receptive_field/256:.2f}s a 256Hz)")
     print(f"├── Filtros: {num_filters}")
-    print(f"├── Bloques TCN: {num_blocks}")
+    print(f"├── Bloques: {num_blocks}")
+    print(f"├── Separable: {separable}")
+    print(f"├── Squeeze-Excitation: {use_squeeze_excitation}")
+    print(f"├── Activación: {activation}")
     print(f"├── Modo: {'Frame-by-frame' if time_step else 'Por ventana'}")
     print(f"└── Salida: {'One-hot' if one_hot else 'Binario'}")
     
     return model
 
-def calculate_receptive_field(num_blocks, kernel_size, use_adaptive_dilation=True):
-    """Calcula el campo receptivo total de la red"""
-    rf = 1
+def calculate_receptive_field(num_blocks, kernel_size):
+    """
+    Calcula el campo receptivo total de la TCN
+    
+    Para TCN con dilataciones exponenciales: 2^0, 2^1, 2^2, ...
+    RF = 1 + sum((kernel_size - 1) * dilation_rate for each block)
+    
+    Args:
+        num_blocks: Número de bloques TCN
+        kernel_size: Tamaño del kernel de convolución
+    
+    Returns:
+        int: Campo receptivo total en muestras
+    """
+    receptive_field = 1
     for i in range(num_blocks):
-        if use_adaptive_dilation:
-            dilation = 2**min(i, 6)
-        else:
-            dilation = 2**i
-        rf += (kernel_size - 1) * dilation
-    return rf
+        dilation_rate = 2 ** i
+        receptive_field += (kernel_size - 1) * dilation_rate
+    
+    # Nota: Cada bloque TCN tiene 2 convoluciones, pero la segunda 
+    # no aumenta el campo receptivo debido al residual connection
+    return receptive_field
 
-# Funciones de utilidad adicionales
-def create_seizure_tcn(input_channels=22, window_length_samples=1280, **kwargs):
-    """Factory function para crear TCN optimizada para convulsiones"""
+def analyze_receptive_field_for_eeg(sample_rate=256):
+    """
+    Analiza diferentes configuraciones de TCN para determinar 
+    el campo receptivo óptimo para detección de convulsiones EEG
     
-    # ✅ FIXED: Configuración que detecta automáticamente el modo correcto
-    default_config = {
-        'input_dim': input_channels,
-        'num_classes': 2 if kwargs.get('one_hot', True) else 1,  # Auto-detect classes
-        'num_filters': 32,  # Reducido para evitar overfitting
-        'kernel_size': 7,
-        'num_blocks': 4,    # Reducido para ser más eficiente
-        'time_step': kwargs.get('time_step', True),
-        'one_hot': kwargs.get('one_hot', True),
-        'dropout': 0.3,
-        'use_se': True,
-        'use_multiscale': False,  # Disabled por defecto para simplicidad
-        'separable': True,
-        'use_adaptive_dilation': True,
-        'use_residual_scaling': True
-    }
+    Args:
+        sample_rate: Frecuencia de muestreo en Hz (default: 256)
+    """
+    print("📊 Análisis de Campo Receptivo para Detección de Convulsiones EEG")
+    print("=" * 70)
+    print(f"Frecuencia de muestreo: {sample_rate} Hz")
+    print("")
     
-    # Actualizar con parámetros proporcionados
-    default_config.update(kwargs)
+    configs = [
+        {'blocks': 3, 'kernel': 7, 'name': 'Básica (rápida)'},
+        {'blocks': 4, 'kernel': 7, 'name': 'Estándar'},
+        {'blocks': 5, 'kernel': 7, 'name': 'Mejorada'},
+        {'blocks': 6, 'kernel': 7, 'name': 'Avanzada'},
+        {'blocks': 7, 'kernel': 7, 'name': 'Completa'},
+        {'blocks': 4, 'kernel': 11, 'name': 'Kernel grande'},
+        {'blocks': 8, 'kernel': 3, 'name': 'Muchos bloques'},
+    ]
     
-    # ✅ CRITICAL: Forzar num_classes correcto basado en one_hot
-    if not default_config['one_hot']:
-        default_config['num_classes'] = 1
+    print(f"{'Configuración':<20} | {'RF (muestras)':<12} | {'Tiempo (s)':<10} | {'Recomendación'}")
+    print("-" * 70)
     
-    return build_optimized_seizure_tcn(**default_config)
+    for config in configs:
+        rf = calculate_receptive_field(config['blocks'], config['kernel'])
+        time_seconds = rf / sample_rate
+        
+        # Determinar recomendación basada en literatura EEG
+        if time_seconds < 1.0:
+            recommendation = "⚠️  Muy pequeño"
+        elif time_seconds < 2.0:
+            recommendation = "🔶 Mínimo"
+        elif time_seconds < 5.0:
+            recommendation = "✅ Óptimo"
+        elif time_seconds < 8.0:
+            recommendation = "🟡 Grande"
+        else:
+            recommendation = "🔴 Excesivo"
+        
+        print(f"{config['name']:<20} | {rf:<12} | {time_seconds:<10.2f} | {recommendation}")
+    
+    print("\n🧠 Recomendaciones para Convulsiones EEG:")
+    print("├── ⚠️  < 1s: Insuficiente para capturar patrones pre-ictales")
+    print("├── 🔶 1-2s: Mínimo para detección básica")
+    print("├── ✅ 2-5s: Óptimo para balance precisión/eficiencia")
+    print("├── 🟡 5-8s: Puede capturar más contexto pero riesgo overfitting")
+    print("└── 🔴 > 8s: Excesivo, probable overfitting y alta latencia")
+    
+    print(f"\n💡 Para tu aplicación:")
+    print(f"├── Tiempo objetivo: 2-4 segundos ({2*sample_rate}-{4*sample_rate} muestras)")
+    print(f"├── Configuración recomendada: 7 bloques, kernel=7")
+    print(f"└── Campo receptivo resultante: ~{calculate_receptive_field(7, 7)} muestras ({calculate_receptive_field(7, 7)/sample_rate:.2f}s)")
+    
+    return calculate_receptive_field(7, 7)  # Retornar configuración recomendada

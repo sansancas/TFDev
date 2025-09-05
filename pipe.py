@@ -1,1325 +1,681 @@
-import os
-import time
-import datetime
+# shukeda_optimized.py
+# Pipeline EEG — estable, serializable y con métricas/ETA ligeros
+# - ONEHOT/BINARIO y TIME_STEP on/off
+# - Métricas nativas + custom (BA, Brier, Spec@t, Sens@Spec, Spec@Sens, TP/TN/FP/FN@t)
+# - LR Warmup + Cosine, ¡serializable!
+# - Checkpoints por múltiples monitores (solo pesos)
+# - Entrenamiento con repeat() + steps explícitos
+# - Verbose=2 con LightETA (estado/ETA cada N segundos)
+
+import os, re, gc, glob, time, math, logging
 from pathlib import Path
+from datetime import datetime
+import numpy as np
 import tensorflow as tf
-from dataset import create_dataset_final, write_tfrecord_splits_FINAL_CORRECTED
-from models.TCN import create_seizure_tcn
-from keras.losses import CategoricalFocalCrossentropy, BinaryFocalCrossentropy
 
-ONEHOT=False
-TIMESTEP=True
+# ========================== CONFIG GLOBAL ====================================
+ONEHOT        = False          # True: salida one-hot (2 clases); False: binaria (1 salida)
+TIME_STEP     = True           # True: salida (B,T,C/1); False: (B,C/1)
+WINDOW_SEC    = 5.0
+FRAME_HOP_SEC = 3.0
+FS_TARGET     = 256
+BATCH_SIZE    = 8
+EPOCHS        = 100
+LEARNING_RATE = 2e-4
+WARMUP_RATIO  = 0.1            # fracción de pasos para warmup
+MIN_LR_FRAC   = 0.05           # mínimo relativo en CosineDecay
+WEIGHT_DECAY  = 1e-3
+TIME_LIMIT_H  = 48
+LIMITS        = {'train': 30, 'dev': 2, 'eval': 2}
+WRITE_TFREC   = True
+BALANCE_POS_FRAC = None        # si tu create_dataset_final lo soporta (p.ej. 0.5)
 
-# ====================================================================================
-# MÉTRICAS PERSONALIZADAS PARA EVALUACIÓN MÉDICA
-# ====================================================================================
+# Métricas: umbrales fijos y objetivos de operación
+THRESHOLDS              = [0.30, 0.50, 0.70]         # crea recall@t, specificity@t, TP/TN/FP/FN@t, BA@t
+SENS_AT_SPEC_TARGETS    = [0.90, 0.95]    # sensibilidad a especificidad objetivo
+SPEC_AT_SENS_TARGETS    = [0.90]          # especificidad a sensibilidad objetivo
 
-class MetricsNormalizationMixin:
-    """Mixin class with XLA-compatible shared normalization methods"""
-    
-    @staticmethod
-    def _normalize_predictions_shared(y_true, y_pred):
-        """
-        ✅ XLA-COMPATIBLE: Ultra-simplified shared normalization without tf.cond
-        Strategy: Always flatten and apply threshold - works for all cases
-        """
-        # ===============================
-        # STEP 1: FLATTEN EVERYTHING TO 1D
-        # ===============================
-        y_pred_flat = tf.reshape(y_pred, [-1])
-        y_true_flat = tf.reshape(y_true, [-1])
-        
-        # ===============================
-        # STEP 2: SIMPLE BINARY CONVERSION
-        # ===============================
-        
-        # For predictions: convert to binary using simple threshold
-        # This works for both probability outputs, logits, and multiclass
-        y_pred_binary = tf.cast(y_pred_flat > 0.5, tf.int32)
-        
-        # For labels: handle different input types uniformly
-        # Cast to float first, then threshold, then back to int
-        y_true_float = tf.cast(y_true_flat, tf.float32)
-        y_true_binary = tf.cast(y_true_float > 0.5, tf.int32)
-        
-        # ===============================
-        # STEP 3: ENSURE SAME LENGTH
-        # ===============================
-        pred_len = tf.shape(y_pred_binary)[0]
-        true_len = tf.shape(y_true_binary)[0]
-        min_len = tf.minimum(pred_len, true_len)
-        
-        y_pred_final = y_pred_binary[:min_len]
-        y_true_final = y_true_binary[:min_len]
-        
-        return y_true_final, y_pred_final
-    
-    @staticmethod
-    def _handle_temporal_pred(y_pred):
-        """
-        ✅ XLA-COMPATIBLE: Simplified temporal handling without tf.cond
-        """
-        # Simply flatten and take mean - works for all temporal cases
-        y_pred_flat = tf.reshape(y_pred, [-1])
-        # Take mean to collapse temporal dimension
-        return tf.reduce_mean(y_pred_flat)
+# Monitores de checkpoints
+PRIMARY_MONITOR         = "val_auc_pr"
+SECONDARY_MONITORS      = []  # si vacío, se autollenan según listas de arriba
 
-class BalancedAccuracy(tf.keras.metrics.Metric, MetricsNormalizationMixin):
-    """Balanced Accuracy para clases desbalanceadas - XLA compatible"""
-    def __init__(self, name='balanced_accuracy', **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.tp = self.add_weight(name='tp', initializer='zeros')
-        self.tn = self.add_weight(name='tn', initializer='zeros')
-        self.fp = self.add_weight(name='fp', initializer='zeros')
-        self.fn = self.add_weight(name='fn', initializer='zeros')
-    
+# Dirs (ajusta a tu estructura)
+FULL_REC = '../records2' if ONEHOT else '../bin_records2'
+CUT_REC  = '../records_cut2' if ONEHOT else '../bin_records_cut2'
+TFRECORD_DIR = CUT_REC
+RUNS_DIR = Path("./runs")
+RUN_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
+RUN_DIR = RUNS_DIR / f"eeg_seizures_{RUN_STAMP}"
+
+# ======================= IMPORTA DATASET Y MODELO ============================
+from dataset import write_tfrecord_splits_FINAL_CORRECTED, create_dataset_final
+from models.TCN import build_tcn
+
+# ====================== SILENCIAR / MIXED PRECISION ==========================
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+try: tf.get_logger().setLevel(logging.ERROR)
+except Exception: pass
+
+# Mixed precision
+tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+# Determinismo “razonable”
+os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
+os.environ.setdefault("TF_CUDNN_DETERMINISTIC", "1")
+os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")  # evita pequeñas diferencias numéricas
+np.random.seed(42); tf.random.set_seed(42)
+
+# Desactivar barra interactiva (usamos verbose=2 + LightETA)
+tf.keras.utils.disable_interactive_logging()
+
+# ====================== UTILIDADES DE FORMAS =================================
+def _norm_shapes(y_true, y_pred, is_onehot: bool):
+    """
+    Devuelve y_true, y_pred en tf.float32 y compatibles.
+    - Si ONEHOT: colapsa a prob/etiqueta de clase positiva (índice 1).
+    - Si TIME_STEP: replica y_true cuando venga sin eje temporal.
+    """
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+
+    # Manejo del eje temporal si aparece en y_pred
+    if len(y_pred.shape) == 3:  # (B,T,C/1)
+        if len(y_true.shape) == 1:
+            y_true = tf.expand_dims(y_true, 1)                 # (B,1)
+            y_true = tf.tile(y_true, [1, tf.shape(y_pred)[1]]) # (B,T)
+        elif len(y_true.shape) == 2 and (is_onehot and y_true.shape[-1] == 2):
+            y_true = tf.expand_dims(y_true, 1)                      # (B,1,2)
+            y_true = tf.tile(y_true, [1, tf.shape(y_pred)[1], 1])   # (B,T,2)
+        if y_pred.shape[-1] == 1:
+            y_pred = tf.squeeze(y_pred, -1)                    # (B,T)
+
+    if len(y_pred.shape) == 2 and y_pred.shape[-1] == 1:
+        y_pred = tf.squeeze(y_pred, -1)                        # (B,)
+
+    # Selección de clase positiva
+    if is_onehot:
+        if len(y_true.shape) >= 2 and y_true.shape[-1] == 2:
+            y_true = y_true[..., 1]
+        if len(y_pred.shape) >= 2 and y_pred.shape[-1] == 2:
+            y_pred = y_pred[..., 1]
+
+    return y_true, y_pred
+
+def _binarize01(t):  # por si etiquetas llegan como floats
+    return tf.cast(t >= 0.5, tf.float32)
+
+# ================= MÉTRICAS PERSONALIZADAS / WRAPPERS ========================
+class BalancedAccuracy(tf.keras.metrics.Metric):
+    """BA = 0.5*(TPR + TNR) a umbral fijo (threshold)."""
+    def __init__(self, threshold=0.5, name="balanced_accuracy", **kw):
+        super().__init__(name=name, **kw)
+        self.th = float(threshold)
+        self.tp = self.add_weight(name="tp", shape=(), initializer="zeros", dtype="float32")
+        self.tn = self.add_weight(name="tn", shape=(), initializer="zeros", dtype="float32")
+        self.fp = self.add_weight(name="fp", shape=(), initializer="zeros", dtype="float32")
+        self.fn = self.add_weight(name="fn", shape=(), initializer="zeros", dtype="float32")
+
     def update_state(self, y_true, y_pred, sample_weight=None):
-        # Use XLA-compatible shared normalization method
-        y_true_norm, y_pred_norm = self._normalize_predictions_shared(y_true, y_pred)
-        
-        self.tp.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 1, y_pred_norm == 1), tf.float32)))
-        self.tn.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 0, y_pred_norm == 0), tf.float32)))
-        self.fp.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 0, y_pred_norm == 1), tf.float32)))
-        self.fn.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 1, y_pred_norm == 0), tf.float32)))
-    
-    # Keep backward compatibility methods but delegate to XLA-compatible ones
-    def _normalize_predictions(self, y_true, y_pred):
-        return self._normalize_predictions_shared(y_true, y_pred)
-    
-    def _handle_temporal_pred(self, y_pred):
-        return MetricsNormalizationMixin._handle_temporal_pred(y_pred)
-    
-    def result(self):
-        sensitivity = self.tp / (self.tp + self.fn + tf.keras.backend.epsilon())
-        specificity = self.tn / (self.tn + self.fp + tf.keras.backend.epsilon())
-        return (sensitivity + specificity) / 2.0
-    
-    def reset_state(self):
-        self.tp.assign(0)
-        self.tn.assign(0)
-        self.fp.assign(0)
-        self.fn.assign(0)
+        y_true, y_pred = _norm_shapes(y_true, y_pred, is_onehot=ONEHOT)
+        y_true = _binarize01(y_true)
+        y_hat = tf.cast(y_pred >= self.th, tf.float32)
+        tp = y_hat * y_true
+        tn = (1.0 - y_hat) * (1.0 - y_true)
+        fp = y_hat * (1.0 - y_true)
+        fn = (1.0 - y_hat) * y_true
+        if sample_weight is not None:
+            sw = tf.cast(sample_weight, tf.float32)
+            tp, tn, fp, fn = sw*tp, sw*tn, sw*fp, sw*fn
+        self.tp.assign_add(tf.reduce_sum(tp))
+        self.tn.assign_add(tf.reduce_sum(tn))
+        self.fp.assign_add(tf.reduce_sum(fp))
+        self.fn.assign_add(tf.reduce_sum(fn))
 
-class Sensitivity(tf.keras.metrics.Metric, MetricsNormalizationMixin):
-    """Sensitivity (Recall) para detección médica - XLA compatible"""
-    def __init__(self, name='sensitivity', **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.tp = self.add_weight(name='tp', initializer='zeros')
-        self.fn = self.add_weight(name='fn', initializer='zeros')
-    
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        # ✅ XLA-COMPATIBLE: Use simplified shared normalization method
-        y_true_norm, y_pred_norm = self._normalize_predictions_shared(y_true, y_pred)
-        
-        self.tp.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 1, y_pred_norm == 1), tf.float32)))
-        self.fn.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 1, y_pred_norm == 0), tf.float32)))
-    
     def result(self):
-        return self.tp / (self.tp + self.fn + tf.keras.backend.epsilon())
-    
-    def reset_state(self):
-        self.tp.assign(0)
-        self.fn.assign(0)
+        tpr = tf.math.divide_no_nan(self.tp, self.tp + self.fn)
+        tnr = tf.math.divide_no_nan(self.tn, self.tn + self.fp)
+        return 0.5 * (tpr + tnr)
 
-class Specificity(tf.keras.metrics.Metric, MetricsNormalizationMixin):
-    """Specificity para detección médica - XLA compatible"""
-    def __init__(self, name='specificity', **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.tn = self.add_weight(name='tn', initializer='zeros')
-        self.fp = self.add_weight(name='fp', initializer='zeros')
-    
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        # ✅ XLA-COMPATIBLE: Use simplified shared normalization method
-        y_true_norm, y_pred_norm = self._normalize_predictions_shared(y_true, y_pred)
-        
-        self.tn.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 0, y_pred_norm == 0), tf.float32)))
-        self.fp.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 0, y_pred_norm == 1), tf.float32)))
-    
-    def result(self):
-        return self.tn / (self.tn + self.fp + tf.keras.backend.epsilon())
-    
-    def reset_state(self):
-        self.tn.assign(0)
-        self.fp.assign(0)
+    def reset_states(self):
+        for v in (self.tp, self.tn, self.fp, self.fn):
+            v.assign(0.0)
 
 class BrierScore(tf.keras.metrics.Metric):
-    """Optimized Brier Score for all prediction/label combinations"""
-    def __init__(self, name='brier_score', **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.sum_squared_error = self.add_weight(name='sse', initializer='zeros')
-        self.count = self.add_weight(name='count', initializer='zeros')
-    
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        # Convert to probabilities and binary labels consistently
-        y_true_prob, y_pred_prob = self._normalize_to_probabilities(y_true, y_pred)
-        
-        # Clip predictions for numerical stability
-        y_pred_prob = tf.clip_by_value(y_pred_prob, 1e-7, 1.0 - 1e-7)
-        
-        # Compute Brier score
-        squared_diff = tf.square(y_true_prob - y_pred_prob)
-        
-        self.sum_squared_error.assign_add(tf.reduce_sum(squared_diff))
-        self.count.assign_add(tf.cast(tf.size(y_true_prob), tf.float32))
-    
-    def _normalize_to_probabilities(self, y_true, y_pred):
-        """
-        ✅ COMPLETELY REWRITTEN: All TensorFlow operations, no Python conditionals
-        Ultra-simple approach: always treat as binary probabilities
-        """
-        
-        # ===============================
-        # HANDLE y_pred: Ultra-simple conversion
-        # ===============================
-        def process_predictions_simple(y_pred):
-            """Super simple: flatten, check range, apply appropriate transformation"""
-            # Flatten everything to 1D first
-            y_pred_flat = tf.reshape(y_pred, [-1])
-            
-            # Check value ranges using TensorFlow operations only
-            max_val = tf.reduce_max(y_pred_flat)
-            min_val = tf.reduce_min(y_pred_flat)
-            
-            # Simple decision tree using only tf.cond
-            # If values look like probabilities [0,1], keep them
-            # If values look like logits, apply sigmoid
-            # Otherwise, apply sigmoid as fallback
-            
-            is_prob_like = tf.logical_and(
-                tf.greater_equal(min_val, -0.1),
-                tf.less_equal(max_val, 1.1)
-            )
-            
-            def keep_as_prob():
-                return tf.clip_by_value(y_pred_flat, 0.0, 1.0)
-            
-            def apply_sigmoid():
-                return tf.nn.sigmoid(y_pred_flat)
-            
-            return tf.cond(is_prob_like, keep_as_prob, apply_sigmoid)
-        
-        y_pred_prob = process_predictions_simple(y_pred)
-        
-        # ===============================
-        # HANDLE y_true: Ultra-simple conversion
-        # ===============================
-        def process_labels_simple(y_true):
-            """Super simple: flatten, cast to float, clip to [0,1]"""
-            # Flatten everything to 1D first
-            y_true_flat = tf.reshape(y_true, [-1])
-            
-            # Convert to float and clip to [0,1]
-            y_true_float = tf.cast(y_true_flat, tf.float32)
-            
-            # Simple binary conversion: anything > 0.5 is positive
-            return tf.cast(tf.greater(y_true_float, 0.5), tf.float32)
-        
-        y_true_prob = process_labels_simple(y_true)
-        
-        # ===============================
-        # ENSURE SAME LENGTH - SIMPLE
-        # ===============================
-        
-        # Get lengths using TensorFlow operations
-        pred_len = tf.shape(y_pred_prob)[0]
-        true_len = tf.shape(y_true_prob)[0]
-        
-        # Take minimum length
-        min_len = tf.minimum(pred_len, true_len)
-        
-        # Truncate both to same length
-        y_pred_prob = y_pred_prob[:min_len]
-        y_true_prob = y_true_prob[:min_len]
-        
-        # Final safety clipping
-        y_pred_prob = tf.clip_by_value(y_pred_prob, 0.0, 1.0)
-        y_true_prob = tf.clip_by_value(y_true_prob, 0.0, 1.0)
-        
-        return y_true_prob, y_pred_prob
-    
-    def result(self):
-        return self.sum_squared_error / (self.count + tf.keras.backend.epsilon())
-    
-    def reset_state(self):
-        self.sum_squared_error.assign(0)
-        self.count.assign(0)
+    """Brier score (prob. clase positiva vs etiqueta binaria 0/1)."""
+    def __init__(self, name="brier_score", **kw):
+        super().__init__(name=name, **kw)
+        self.sum_err = self.add_weight(name="sum_err", shape=(), initializer="zeros", dtype="float32")
+        self.count   = self.add_weight(name="count",   shape=(), initializer="zeros", dtype="float32")
 
-class TimeLimitCallback(tf.keras.callbacks.Callback):
-    """Callback para limitar tiempo de entrenamiento"""
-    def __init__(self, max_time_hours=24):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _norm_shapes(y_true, y_pred, is_onehot=ONEHOT)
+        y_true = _binarize01(y_true)
+        err = tf.square(y_pred - y_true)
+        if sample_weight is not None:
+            err = err * tf.cast(sample_weight, tf.float32)
+        self.sum_err.assign_add(tf.reduce_sum(err))
+        self.count.assign_add(tf.cast(tf.size(err), tf.float32))
+
+    def result(self):
+        return tf.math.divide_no_nan(self.sum_err, self.count)
+
+    def reset_states(self):
+        self.sum_err.assign(0.0)
+        self.count.assign(0.0)
+
+class SpecificityAtThreshold(tf.keras.metrics.Metric):
+    """Especificidad (TNR) a umbral fijo."""
+    def __init__(self, threshold=0.5, name=None, **kw):
+        name = name or f"specificity@t={threshold:.2f}"
+        super().__init__(name=name, **kw)
+        self.th = float(threshold)
+        self.tn = self.add_weight(name="tn", shape=(), initializer="zeros", dtype="float32")
+        self.fp = self.add_weight(name="fp", shape=(), initializer="zeros", dtype="float32")
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _norm_shapes(y_true, y_pred, is_onehot=ONEHOT)
+        y_true = _binarize01(y_true)
+        y_hat  = tf.cast(y_pred >= self.th, tf.float32)
+        tn = (1.0 - y_hat) * (1.0 - y_true)
+        fp = y_hat * (1.0 - y_true)
+        if sample_weight is not None:
+            sw = tf.cast(sample_weight, tf.float32)
+            tn, fp = sw*tn, sw*fp
+        self.tn.assign_add(tf.reduce_sum(tn))
+        self.fp.assign_add(tf.reduce_sum(fp))
+
+    def result(self):  # TNR
+        return tf.math.divide_no_nan(self.tn, self.tn + self.fp)
+
+    def reset_states(self):
+        self.tn.assign(0.0); self.fp.assign(0.0)
+
+class ShapeAwareWrapper(tf.keras.metrics.Metric):
+    """
+    Envuelve una métrica Keras aplicando _norm_shapes primero.
+    Útil para Recall/Precision con thresholds, TP/TN/FP/FN y
+    SensitivityAtSpecificity / SpecificityAtSensitivity.
+    """
+    def __init__(self, inner_metric, name=None):
+        super().__init__(name=name or inner_metric.name)
+        self.inner = inner_metric
+
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _norm_shapes(y_true, y_pred, is_onehot=ONEHOT)
+        return self.inner.update_state(y_true, y_pred, sample_weight)
+
+    def result(self): return self.inner.result()
+    def reset_states(self): return self.inner.reset_states()
+
+# ======================== PÉRDIDAS ===========================================
+try:
+    from tensorflow.keras.losses import BinaryFocalCrossentropy, CategoricalFocalCrossentropy
+    HAVE_FOCAL = True
+except Exception:
+    HAVE_FOCAL = False
+
+def make_loss(is_onehot: bool):
+    if is_onehot:
+        def loss(y_true, y_pred):
+            if TIME_STEP and len(y_pred.shape) == 3 and len(y_true.shape) == 2:
+                y_true2 = tf.expand_dims(y_true, 1)
+                y_true2 = tf.tile(y_true2, [1, tf.shape(y_pred)[1], 1])
+            else:
+                y_true2 = y_true
+            if HAVE_FOCAL:
+                return CategoricalFocalCrossentropy(alpha=[0.25, 0.75], gamma=2.0, label_smoothing=0.1)(y_true2, y_pred)
+            else:
+                return tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05)(y_true2, y_pred)
+        return loss
+    else:
+        def loss(y_true, y_pred):
+            if TIME_STEP and len(y_pred.shape) == 3 and y_pred.shape[-1] == 1:
+                y_pred2 = tf.squeeze(y_pred, -1)
+            else:
+                y_pred2 = y_pred
+            if TIME_STEP and len(y_true.shape) == 1 and len(y_pred2.shape) == 2:
+                y_true2 = tf.expand_dims(y_true, 1)
+                y_true2 = tf.tile(y_true2, [1, tf.shape(y_pred2)[1]])
+            else:
+                y_true2 = y_true
+            if HAVE_FOCAL:
+                return BinaryFocalCrossentropy(alpha=0.75, gamma=2.0, label_smoothing=0.1)(y_true2, y_pred2)
+            else:
+                return tf.keras.losses.BinaryCrossentropy(label_smoothing=0.05)(y_true2, y_pred2)
+        return loss
+
+# ======================== NOMBRES DE MÉTRICAS =================================
+def _mn_sens_at_spec(s): return f"sens@spec>={s:.2f}"
+def _mn_spec_at_sens(s): return f"spec@sens>={s:.2f}"
+def _mn_recall_t(t):     return f"recall@t={t:.2f}"
+def _mn_spec_t(t):       return f"specificity@t={t:.2f}"
+def _mn_tp_t(t):         return f"TP@t={t:.2f}"
+def _mn_tn_t(t):         return f"TN@t={t:.2f}"
+def _mn_fp_t(t):         return f"FP@t={t:.2f}"
+def _mn_fn_t(t):         return f"FN@t={t:.2f}"
+def _mn_ba_t(t):         return f"balanced_accuracy@t={t:.2f}"
+def _mn_prec_t(t):       return f"precision@t={t:.2f}" 
+
+# ======================== MÉTRICAS ===========================================
+def make_metrics(is_onehot: bool):
+    mets = []
+    # Accuracy apropiada según salida
+    if is_onehot: mets += [tf.keras.metrics.CategoricalAccuracy(name="accuracy")]
+    else:         mets += [tf.keras.metrics.BinaryAccuracy(name="accuracy")]
+
+    # PR / ROC
+    mets += [tf.keras.metrics.AUC(curve="PR", name="auc_pr"),
+             tf.keras.metrics.AUC(curve="ROC", name="auc_roc")]
+
+    # Versiones a umbral fijo + cuentas de la matriz de confusión
+    for t in THRESHOLDS:
+        mets += [ShapeAwareWrapper(tf.keras.metrics.Recall(thresholds=[t]),    name=_mn_recall_t(t))]
+        mets += [SpecificityAtThreshold(threshold=t,                          name=_mn_spec_t(t))]
+        mets += [ShapeAwareWrapper(tf.keras.metrics.Precision(thresholds=[t]), name=_mn_prec_t(t))]  # <---
+        mets += [
+            ShapeAwareWrapper(tf.keras.metrics.TruePositives(thresholds=[t]),  name=_mn_tp_t(t)),
+            ShapeAwareWrapper(tf.keras.metrics.TrueNegatives(thresholds=[t]),  name=_mn_tn_t(t)),
+            ShapeAwareWrapper(tf.keras.metrics.FalsePositives(thresholds=[t]), name=_mn_fp_t(t)),
+            ShapeAwareWrapper(tf.keras.metrics.FalseNegatives(thresholds=[t]), name=_mn_fn_t(t)),
+        ]
+        mets += [BalancedAccuracy(threshold=t, name=_mn_ba_t(t))]
+
+    # Objetivos (sin fijar umbral; barrido interno)
+    for s in SENS_AT_SPEC_TARGETS:
+        mets += [ShapeAwareWrapper(tf.keras.metrics.SensitivityAtSpecificity(specificity=s), name=_mn_sens_at_spec(s))]
+    for s in SPEC_AT_SENS_TARGETS:
+        mets += [ShapeAwareWrapper(tf.keras.metrics.SpecificityAtSensitivity(sensitivity=s), name=_mn_spec_at_sens(s))]
+
+    # Alias BA principal (usa el primer umbral)
+    mets += [BalancedAccuracy(threshold=THRESHOLDS[0], name="balanced_accuracy")]
+
+    # Calibración
+    mets += [BrierScore(name="brier_score")]
+    return mets
+
+# ============== LR schedule: Warmup + CosineDecay serializable ================
+@tf.keras.utils.register_keras_serializable(package="sched")
+class WarmupCosineSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, base_lr, total_steps, warmup_ratio=0.1, min_lr_frac=0.05, name=None):
         super().__init__()
-        self.max_time_seconds = max_time_hours * 3600
-        self.start_time = None
-    
-    def on_train_begin(self, logs=None):
-        self.start_time = time.time()
-    
-    def on_epoch_end(self, epoch, logs=None):
-        if time.time() - self.start_time > self.max_time_seconds:
-            self.model.stop_training = True
+        self.base_lr = float(base_lr)
+        self.total_steps = int(max(1, total_steps))
+        self.warmup_ratio = float(warmup_ratio)
+        self.min_lr_frac = float(min_lr_frac)
 
-class ConfusionMatrixMetrics(tf.keras.metrics.Metric):
-    """XLA/JIT compatible confusion matrix metrics using simplified approach"""
-    
-    def __init__(self, num_classes=2, name='confusion_matrix', **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.num_classes = num_classes
-        self.tp = self.add_weight(name='tp', initializer='zeros')
-        self.tn = self.add_weight(name='tn', initializer='zeros')
-        self.fp = self.add_weight(name='fp', initializer='zeros')
-        self.fn = self.add_weight(name='fn', initializer='zeros')
-    
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true_norm, y_pred_norm = self._normalize_predictions(y_true, y_pred)
-        
-        self.tp.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 1, y_pred_norm == 1), tf.float32)))
-        self.tn.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 0, y_pred_norm == 0), tf.float32)))
-        self.fp.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 0, y_pred_norm == 1), tf.float32)))
-        self.fn.assign_add(tf.reduce_sum(tf.cast(tf.logical_and(y_true_norm == 1, y_pred_norm == 0), tf.float32)))
-    
-    def _normalize_predictions(self, y_true, y_pred):
-        """
-        ✅ XLA/JIT COMPATIBLE: Ultra-simplified normalization without problematic tf.cond
-        Strategy: Always flatten first, then process uniformly
-        """
-        # ===============================
-        # STEP 1: FLATTEN EVERYTHING TO 1D
-        # ===============================
-        y_pred_flat = tf.reshape(y_pred, [-1])
-        y_true_flat = tf.reshape(y_true, [-1])
-        
-        # ===============================
-        # STEP 2: SIMPLE BINARY CONVERSION
-        # ===============================
-        
-        # For predictions: convert to binary using simple threshold
-        # This works for both probability outputs and logits
-        y_pred_binary = tf.cast(y_pred_flat > 0.5, tf.int32)
-        
-        # For labels: handle different input types uniformly
-        # Cast to float first, then threshold, then back to int
-        y_true_float = tf.cast(y_true_flat, tf.float32)
-        y_true_binary = tf.cast(y_true_float > 0.5, tf.int32)
-        
-        # ===============================
-        # STEP 3: ENSURE SAME LENGTH
-        # ===============================
-        pred_len = tf.shape(y_pred_binary)[0]
-        true_len = tf.shape(y_true_binary)[0]
-        min_len = tf.minimum(pred_len, true_len)
-        
-        y_pred_final = y_pred_binary[:min_len]
-        y_true_final = y_true_binary[:min_len]
-        
-        return y_true_final, y_pred_final
-    
-    def result(self):
-        total = self.tp + self.tn + self.fp + self.fn
-        return (self.tp + self.tn) / (total + tf.keras.backend.epsilon())
-    
-    def reset_state(self):
-        self.tp.assign(0)
-        self.tn.assign(0)
-        self.fp.assign(0)
-        self.fn.assign(0)
-    
-    def get_confusion_matrix_values(self):
+        self.warmup_steps = int(max(1, self.warmup_ratio * self.total_steps))
+        self.decay_steps  = int(max(1, self.total_steps - self.warmup_steps))
+        self.min_lr = self.base_lr * self.min_lr_frac
+
+        self.cosine = tf.keras.optimizers.schedules.CosineDecay(
+            initial_learning_rate=self.base_lr,
+            decay_steps=self.decay_steps,
+            alpha=self.min_lr / self.base_lr
+        )
+        self._name = name or "WarmupCosineSchedule"
+
+    def __call__(self, step):
+        step = tf.cast(step, tf.int32)
+        def _warm():
+            return self.base_lr * tf.cast(step, tf.float32) / float(self.warmup_steps)
+        def _cos():
+            return self.cosine(tf.cast(step - self.warmup_steps, tf.float32))
+        return tf.cond(step < self.warmup_steps, _warm, _cos)
+
+    def get_config(self):
         return {
-            'tp': float(self.tp.numpy()),
-            'tn': float(self.tn.numpy()),
-            'fp': float(self.fp.numpy()),
-            'fn': float(self.fn.numpy())
+            "base_lr": self.base_lr,
+            "total_steps": self.total_steps,
+            "warmup_ratio": self.warmup_ratio,
+            "min_lr_frac": self.min_lr_frac,
+            "name": self._name,
         }
 
-class TimePerEpochCallback(tf.keras.callbacks.Callback):
-    """Callback optimizado para medir tiempo por época"""
-    
-    def __init__(self):
-        super().__init__()
-        self.epoch_times = []
-        self.epoch_start_time = None
-    
-    def on_epoch_begin(self, epoch, logs=None):
-        self.epoch_start_time = time.time()
-    
-    def on_epoch_end(self, epoch, logs=None):
-        if self.epoch_start_time is not None:
-            epoch_time = time.time() - self.epoch_start_time
-            self.epoch_times.append(epoch_time)
-            
-            if logs is not None:
-                logs['epoch_time'] = epoch_time
-                logs['epoch_time_minutes'] = epoch_time / 60.0
-                logs['avg_epoch_time'] = sum(self.epoch_times) / len(self.epoch_times)
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
-class EnhancedCSVLogger(tf.keras.callbacks.CSVLogger):
-    """CSV Logger optimizado"""
-    
-    def __init__(self, filename, separator=',', append=False):
-        super().__init__(filename, separator, append)
-        self.confusion_metrics = None
-    
-    def set_model(self, model):
-        super().set_model(model)
-        for metric in model.metrics:
-            if isinstance(metric, ConfusionMatrixMetrics):
-                self.confusion_metrics = metric
-                break
-    
-    def on_epoch_end(self, epoch, logs=None):
-        if logs is not None and self.confusion_metrics is not None:
-            try:
-                cm_values = self.confusion_metrics.get_confusion_matrix_values()
-                logs.update({
-                    'tp': cm_values['tp'],
-                    'tn': cm_values['tn'], 
-                    'fp': cm_values['fp'],
-                    'fn': cm_values['fn'],
-                    'ppv': cm_values['tp'] / (cm_values['tp'] + cm_values['fp'] + 1e-7),
-                    'npv': cm_values['tn'] / (cm_values['tn'] + cm_values['fn'] + 1e-7)
-                })
-            except:
-                pass
-        
-        super().on_epoch_end(epoch, logs)
+# =================== UTILIDADES DATA/LOGGING/CALLBACKS =======================
+def cardinality_safe(ds, fallback_scan=True, max_scan=200000):
+    card = int(tf.data.experimental.cardinality(ds).numpy())
+    if card < 0 and fallback_scan:  # UNKNOWN_CARDINALITY
+        card = sum(1 for _ in ds.take(max_scan))
+    return max(1, card)
 
-def create_runs_directory(base_name="seizure_experiment"):
-    """Crea directorio organizado para experimentos"""
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"{base_name}_{timestamp}"
-    
-    runs_dir = Path("runs")
-    experiment_dir = runs_dir / run_name
-    
-    dirs_to_create = [
-        experiment_dir,
-        experiment_dir / "models",
-        experiment_dir / "checkpoints", 
-        experiment_dir / "logs",
-        experiment_dir / "tensorboard"
-    ]
-    
-    for dir_path in dirs_to_create:
-        dir_path.mkdir(parents=True, exist_ok=True)
-    
-    return experiment_dir
-
-def create_label_transformer(model_info, onehot):
-    """Create optimized label transformer based on model output characteristics"""
-    
-    def transform_labels(x, y):
-        """Transform labels AND inputs to match model format"""
-        
-        # ✅ CRITICAL FIX: Handle input transpose for BATCHED data
-        if model_info.get('needs_transpose', False):
-            # During training, x has shape (batch, channels, timepoints)
-            # We need (batch, timepoints, channels)
-            if len(x.shape) == 3:  # Batched data: (batch, channels, timepoints)
-                x = tf.transpose(x, [0, 2, 1])  # -> (batch, timepoints, channels)
-            elif len(x.shape) == 2:  # Single sample: (channels, timepoints)
-                x = tf.transpose(x, [1, 0])  # -> (timepoints, channels)
-        
-        # ✅ FIXED: Handle labels based on model's ACTUAL output expectation
-        if not onehot:
-            # Binary mode - modelo espera (batch, time, 1) o (batch, 1)
-            if len(y.shape) > 1:
-                if y.shape[-1] == 2:
-                    # One-hot to binary: take positive class
-                    y = y[1]
-                else:
-                    y = tf.squeeze(y)
-            
-            # Ensure scalar float
-            y = tf.cast(y, tf.float32)
-            if len(y.shape) > 0:
-                y = tf.reduce_mean(y)
-            
-            # ✅ CRITICAL FIX: Only expand if model outputs temporal
-            if model_info['outputs_temporal']:
-                # Model expects (batch, time, 1)
-                time_steps = model_info['output_shape'][0]
-                batch_size = tf.shape(x)[0]
-                
-                # Create (batch, time, 1) labels
-                y = tf.fill([batch_size, time_steps, 1], y)
-            else:
-                # Model expects (batch, 1) - keep as scalar and expand later
-                y = tf.expand_dims(y, axis=-1)  # (batch, 1)
-                
-        else:
-            # One-hot mode - modelo espera (batch, time, 2) o (batch, 2)  
-            if len(y.shape) == 1:
-                if y.shape[0] == 2:
-                    # Already one-hot - ensure float
-                    y = tf.cast(y, tf.float32)
-                elif y.shape[0] == 1:
-                    # Convert single value to one-hot
-                    y = tf.cast(y[0], tf.int32)
-                    y = tf.one_hot(y, depth=2)
-                else:
-                    # Convert first element to one-hot
-                    y = tf.cast(y[0], tf.int32)
-                    y = tf.one_hot(y, depth=2)
-            elif len(y.shape) == 0:
-                # Scalar to one-hot
-                y = tf.cast(y, tf.int32)
-                y = tf.one_hot(y, depth=2)
-            elif len(y.shape) > 1:
-                # Multi-dimensional - check if already one-hot
-                if y.shape[-1] == 2:
-                    y = tf.cast(y, tf.float32)
-                else:
-                    # Take appropriate element and convert
-                    y_val = tf.cast(y[0] if len(y.shape) > 1 else y, tf.int32)
-                    y = tf.one_hot(y_val, depth=2)
-            
-            # Ensure output is float32
-            y = tf.cast(y, tf.float32)
-            
-            # ✅ CRITICAL FIX: Only expand if model outputs temporal
-            if model_info['outputs_temporal']:
-                # Model expects (batch, time, 2)
-                time_steps = model_info['output_shape'][0]
-                batch_size = tf.shape(x)[0]
-                
-                # Expand to temporal: (batch, 2) -> (batch, time, 2)
-                y = tf.expand_dims(y, axis=1)  # (batch, 1, 2)
-                y = tf.tile(y, [1, time_steps, 1])  # (batch, time, 2)
-            # If not temporal, y should already be (batch, 2)
-        
-        return x, y
-    
-    return transform_labels
-
-def create_optimized_dataset_pipeline(tfrecord_files, n_channels, n_timepoints, batch_size, one_hot, is_training=True):
-    """Optimized dataset creation with proper validation and preprocessing"""
-    
-    def parse_and_validate(x, y):
-        """Parse and validate data with proper error handling"""
-        # Validate and clean input data (x should be float)
-        x = tf.cast(x, tf.float32)
-        x = tf.where(tf.math.is_nan(x), tf.zeros_like(x), x)
-        x = tf.where(tf.math.is_inf(x), tf.zeros_like(x), x)
-        
-        # Handle labels based on their data type
-        if y.dtype in [tf.int32, tf.int64]:
-            # Labels are integers - convert to float for validation if needed
-            y_float = tf.cast(y, tf.float32)
-            y_float = tf.where(tf.math.is_nan(y_float), tf.zeros_like(y_float), y_float)
-            y_float = tf.where(tf.math.is_inf(y_float), tf.zeros_like(y_float), y_float)
-            # Convert back to int if originally integer
-            y = tf.cast(y_float, y.dtype)
-        else:
-            # Labels are float - normal validation
-            y = tf.cast(y, tf.float32)
-            y = tf.where(tf.math.is_nan(y), tf.zeros_like(y), y)
-            y = tf.where(tf.math.is_inf(y), tf.zeros_like(y), y)
-        
-        # Normalize input data to reasonable range
-        x = tf.clip_by_value(x, -1000.0, 1000.0)
-        
-        # ✅ KEEP ORIGINAL FORMAT - DO NOT TRANSPOSE HERE
-        # The transpose will be handled in the label_transformer
-        # This ensures dataset inspection shows the original format
-        # but training gets the correct format
-        
-        # Handle labels based on mode and ensure correct data type
-        if not one_hot:
-            # Binary mode - ensure float output
-            if len(y.shape) > 1:
-                # If one-hot encoded, take the positive class
-                if y.shape[-1] == 2:
-                    y = y[1]  # Take positive class
-                else:
-                    y = tf.reduce_mean(tf.cast(y, tf.float32))  # Collapse to single value
-            
-            # ✅ CRITICAL: Keep as scalar for now - expansion happens in label_transformer
-            y = tf.cast(y, tf.float32)
-            if len(y.shape) > 0:
-                y = tf.reduce_mean(y)
-            y = tf.cast(y > 0.5, tf.float32)
-        else:
-            # One-hot mode - ensure proper format
-            if len(y.shape) == 0:
-                # Scalar label - convert to one-hot
-                y = tf.cast(y, tf.int32)
-                y = tf.one_hot(y, depth=2)
-            elif len(y.shape) == 1:
-                if tf.shape(y)[0] == 2:
-                    # Already one-hot - ensure float
-                    y = tf.cast(y, tf.float32)
-                else:
-                    # Single value - convert to one-hot
-                    y = tf.cast(y[0], tf.int32)
-                    y = tf.one_hot(y, depth=2)
-            else:
-                # Multi-dimensional - handle appropriately
-                if y.shape[-1] == 2:
-                    # Already one-hot format
-                    y = tf.cast(y, tf.float32)
-                else:
-                    # Take first element and convert to one-hot
-                    y_val = tf.cast(y[0], tf.int32) if len(y.shape) > 1 else tf.cast(y, tf.int32)
-                    y = tf.one_hot(y_val, depth=2)
-        
-        return x, y
-    
-    # Create base dataset using the corrected create_dataset_final from dataset.py
-    dataset = create_dataset_final(
-        tfrecord_files,
-        n_channels=n_channels,
-        n_timepoints=n_timepoints,
-        batch_size=batch_size,
-        one_hot=one_hot,
-        time_step=False,  # ✅ Force window-level labels initially
-        balance_pos_frac=None,
-        cache=False,
-        drop_remainder=False,
-        shuffle=is_training
-    )
-    
-    # Apply validation and preprocessing
-    dataset = dataset.map(
-        parse_and_validate,
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
-    
-    # Optimization based on training/validation
-    if is_training:
-        dataset = dataset.shuffle(buffer_size=100)
-        dataset = dataset.repeat()
-    
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    
-    return dataset
-
-def build_model_with_validation(model_config, sample_input_shape, onehot=True):
-    """Build model with proper validation and output shape detection"""
-    # ✅ FIXED: Improved GPU strategy initialization with proper memory setup
-    
-    # Initialize GPU memory growth BEFORE creating strategy
-    gpus = tf.config.experimental.list_physical_devices('GPU')
-    strategy = None
-    
-    if gpus:
-        try:
-            # This needs to be done BEFORE any other TensorFlow operations
-            tf.config.experimental.set_memory_growth(gpus[0], True)
-            # Also set visible devices
-            tf.config.experimental.set_visible_devices(gpus[0], 'GPU')
-            
-            # Now create the strategy
-            strategy = tf.distribute.OneDeviceStrategy("GPU:0")
-            print(f"✅ GPU strategy initialized: {gpus[0].name}")
-            
-        except RuntimeError as e:
-            # Memory growth must be set before GPUs have been initialized
-            print(f"⚠️  GPU memory growth setup failed (already initialized): {e}")
-            try:
-                # Try to create strategy anyway
-                strategy = tf.distribute.OneDeviceStrategy("GPU:0")
-                print(f"✅ GPU strategy created despite memory growth warning: {gpus[0].name}")
-            except Exception as e2:
-                print(f"❌ GPU strategy creation failed: {e2}")
-                strategy = tf.distribute.get_strategy()
-        except Exception as e:
-            print(f"❌ GPU setup failed: {e}")
-            strategy = tf.distribute.get_strategy()
-    else:
-        print("❌ No GPU found, using default strategy")
-        strategy = tf.distribute.get_strategy()
-    
-    # Build model within strategy scope
-    with strategy.scope():
-        model = create_seizure_tcn(**model_config)
-    
-    # Determine correct input shape for model
-    # Model expects (batch, time, channels) format
-    if len(sample_input_shape) == 2:
-        if sample_input_shape[0] == model_config['input_channels']:
-            # Current: (channels, timepoints) -> Need: (timepoints, channels)
-            correct_input_shape = (sample_input_shape[1], sample_input_shape[0])
-        else:
-            # Already: (timepoints, channels)
-            correct_input_shape = sample_input_shape
-    else:
-        correct_input_shape = sample_input_shape
-            
-    print(f"Original dataset shape: {sample_input_shape}")
-    print(f"Model input shape: {correct_input_shape}")
-    
-    # Test model with corrected input shape
-    sample_input = tf.random.normal((1,) + correct_input_shape)
-    try:
-        with strategy.scope():
-            sample_output = model(sample_input)
-        
-        model_info = {
-            'input_shape': correct_input_shape,
-            'dataset_shape': sample_input_shape,
-            'output_shape': sample_output.shape[1:],  # Remove batch dimension
-            'outputs_temporal': len(sample_output.shape) == 3 and sample_output.shape[1] > 1,
-            'num_classes': sample_output.shape[-1] if len(sample_output.shape) > 1 else 1,
-            'needs_transpose': sample_input_shape != correct_input_shape,
-            'strategy': strategy  # ✅ Store strategy for later use
-        }
-        
-        print(f"Model built successfully:")
-        print(f"  Expected input shape: {model_info['input_shape']}")
-        print(f"  Dataset input shape: {model_info['dataset_shape']}")
-        print(f"  Needs transpose: {model_info['needs_transpose']}")
-        print(f"  Output shape: {model_info['output_shape']}")
-        print(f"  Temporal outputs: {model_info['outputs_temporal']}")
-        print(f"  Number of classes: {model_info['num_classes']}")
-        print(f"  Strategy: {type(strategy).__name__}")
-        
-        # ✅ Check if actually using GPU
-        if hasattr(strategy, '_device_map') or 'GPU' in str(strategy):
-            print(f"  ✅ Using GPU acceleration")
-        else:
-            print(f"  ⚠️  Using CPU (no GPU acceleration)")
-        
-        return model, model_info
-        
-    except Exception as e:
-        print(f"Model test failed with shape {correct_input_shape}: {e}")
-        
-        # Try alternative input arrangement
-        if len(sample_input_shape) == 2:
-            alt_shape = (sample_input_shape[1], sample_input_shape[0])
-            print(f"Trying alternative shape: {alt_shape}")
-            
-            try:
-                sample_input_alt = tf.random.normal((1,) + alt_shape)
-                with strategy.scope():
-                    sample_output = model(sample_input_alt)
-                
-                model_info = {
-                    'input_shape': alt_shape,
-                    'dataset_shape': sample_input_shape,
-                    'output_shape': sample_output.shape[1:],
-                    'outputs_temporal': len(sample_output.shape) == 3 and sample_output.shape[1] > 1,
-                    'num_classes': sample_output.shape[-1] if len(sample_output.shape) > 1 else 1,
-                    'needs_transpose': True,
-                    'strategy': strategy
-                }
-                
-                print(f"Model built with alternative shape:")
-                print(f"  Model input shape: {model_info['input_shape']}")
-                print(f"  Dataset shape: {model_info['dataset_shape']}")
-                print(f"  Needs transpose: {model_info['needs_transpose']}")
-                print(f"  Output shape: {model_info['output_shape']}")
-                
-                return model, model_info
-                
-            except Exception as e2:
-                raise RuntimeError(f"Model building failed with both shapes. Original: {e}, Alternative: {e2}")
-        else:
-            raise RuntimeError(f"Model building failed: {e}")
-
-def setup_metrics_and_loss(is_binary, class_weights=None, gamma=2.0):
-    """Setup optimized metrics and loss functions"""
-    
-    # ✅ RESTORED: All metrics including the XLA-compatible ConfusionMatrixMetrics
-    # Core metrics that work for all cases
-    metrics = [
-        'accuracy',
-        BalancedAccuracy(),
-        Sensitivity(), 
-        Specificity(),
-        BrierScore(),  # ✅ Working with robust implementation
-        ConfusionMatrixMetrics(num_classes=1 if is_binary else 2)  # ✅ RESTORED with XLA-compatible implementation
-    ]
-    
-    # Additional metrics for specific cases - with better error handling
-    if not is_binary:
-        try:
-            metrics.extend([
-                tf.keras.metrics.Precision(name='precision'),
-                tf.keras.metrics.Recall(name='recall'),
-                tf.keras.metrics.AUC(curve='ROC', name='auc_roc'),
-                tf.keras.metrics.AUC(curve='PR', name='auc_pr')
-            ])
-        except Exception as e:
-            print(f"Warning: Could not add AUC metrics: {e}")
-    else:
-        # Add simple binary metrics that work reliably
-        try:
-            metrics.extend([
-                tf.keras.metrics.Precision(name='precision'),
-                tf.keras.metrics.Recall(name='recall')
-            ])
-        except Exception as e:
-            print(f"Warning: Could not add precision/recall metrics: {e}")
-    
-    # Setup loss function
-    if is_binary:
-        alpha = class_weights[1] if class_weights else 0.75
-        loss_fn = BinaryFocalCrossentropy(alpha=alpha, gamma=gamma)
-    else:
-        loss_fn = CategoricalFocalCrossentropy(alpha=class_weights, gamma=gamma)
-    
-    return metrics, loss_fn
-
-def train_seizure_complete_v2(model_config,
-                             train_dataset, 
-                             val_dataset,
-                             steps_per_epoch,
-                             validation_steps,
-                             epochs=50,
-                             learning_rate=0.001,
-                             class_weights=None,
-                             gamma=2.0,
-                             experiment_name='seizure_model',
-                             monitor_metric='val_accuracy',
-                             patience=10,
-                             max_time_hours=24,
-                             onehot=True,
-                             verbose=False):
-    """Optimized training pipeline with improved error handling"""
-    
-    experiment_dir = create_runs_directory(experiment_name)
-    
-    # File paths
-    model_best_path = experiment_dir / "models" / f"{experiment_name}_best.keras"
-    model_final_path = experiment_dir / "models" / f"{experiment_name}_final.keras" 
-    checkpoint_path = experiment_dir / "checkpoints" / f"{experiment_name}_epoch_{{epoch:03d}}.keras"
-    csv_log_path = experiment_dir / "logs" / f"{experiment_name}_training.csv"
-    tensorboard_path = experiment_dir / "tensorboard"
-    
-    is_binary = not onehot
-    
-    # Inspect dataset to get input shape
-    try:
-        sample_batch = next(iter(train_dataset.take(1)))
-        input_shape = sample_batch[0].shape[1:]  # Remove batch dimension
-        
-        if verbose:
-            print(f"Dataset input shape: {input_shape}")
-            print(f"Dataset label shape: {sample_batch[1].shape}")
-            
-            # Handle scalar labels safely
-            if len(sample_batch[1].shape) == 0:
-                print(f"Labels are scalar - single label: {sample_batch[1]}")
-                label_shape = ()
-            else:
-                label_shape = sample_batch[1].shape[1:] if len(sample_batch[1].shape) > 1 else sample_batch[1].shape
-                print(f"Single label shape: {label_shape}")
-                
-                # Safe slicing for non-scalar labels
-                try:
-                    if sample_batch[1].shape[0] >= 3:
-                        print(f"Sample labels (first 3): {sample_batch[1][:3]}")
-                    else:
-                        print(f"Sample labels (all): {sample_batch[1]}")
-                except:
-                    print(f"Sample labels: {sample_batch[1]}")
-            
-    except Exception as e:
-        raise RuntimeError(f"Could not inspect dataset: {e}")
-    
-    # Build model with validation
-    model, model_info = build_model_with_validation(model_config, input_shape, onehot)
-    
-    # ✅ Get the strategy used for model building
-    strategy = model_info.get('strategy', tf.distribute.get_strategy())
-    
-    # ✅ CRITICAL: Build the model BEFORE compiling to ensure proper shape
-    if model_info['needs_transpose']:
-        # Build with the correct input shape
-        build_input = tf.random.normal((1,) + model_info['input_shape'])
-        with strategy.scope():
-            _ = model(build_input)  # This builds the model with correct shapes
-        if verbose:
-            print(f"Model built and validated with shape: {build_input.shape}")
-    
-    # ✅ FIXED: Setup everything within the SAME strategy scope used for model creation
-    with strategy.scope():
-        # Setup metrics and loss
-        metrics, loss_fn = setup_metrics_and_loss(is_binary, class_weights, gamma)
-        
-        # Setup optimizer
-        optimizer = tf.keras.optimizers.AdamW(
-            learning_rate=learning_rate,
-            weight_decay=0.01,
-            beta_1=0.9,
-            beta_2=0.999
-        )
-        
-        # ✅ RE-ENABLE JIT: Now that ConfusionMatrixMetrics is XLA-compatible
-        try:
-            # Try with JIT compilation first - should work now
-            model.compile(
-                optimizer=optimizer,
-                loss=loss_fn,
-                metrics=metrics,
-                jit_compile=True  # ✅ RE-ENABLED JIT with XLA-compatible metrics
-            )
-            if verbose:
-                print("✅ JIT compilation enabled with XLA-compatible metrics")
-        except Exception as jit_error:
-            if verbose:
-                print(f"⚠️  JIT compilation failed ({jit_error}), falling back to non-JIT")
-            # Fallback to non-JIT compilation
-            model.compile(
-                optimizer=optimizer,
-                loss=loss_fn,
-                metrics=metrics,
-                jit_compile=False
-            )
-    
-    # Transform datasets if needed
-    needs_transform = (
-        model_info.get('needs_transpose', False) or
-        model_info['outputs_temporal'] or 
-        (is_binary and len(sample_batch[1].shape) > 1) or
-        (not is_binary and model_info['outputs_temporal'])
-    )
-    
-    if needs_transform:
-        if verbose:
-            print("Applying dataset transformations...")
-            print(f"  Transpose input: {model_info.get('needs_transpose', False)}")
-            print(f"  Temporal outputs: {model_info['outputs_temporal']}")
-            print(f"  Label shape incompatible: {len(sample_batch[1].shape) > 1 if is_binary else False}")
-        
-        label_transformer = create_label_transformer(model_info, onehot)
-        train_dataset = train_dataset.map(label_transformer, num_parallel_calls=tf.data.AUTOTUNE)
-        val_dataset = val_dataset.map(label_transformer, num_parallel_calls=tf.data.AUTOTUNE)
-        
-        # ✅ ENHANCED: Validate transformation with proper error handling
-        if verbose:
-            try:
-                transformed_batch = next(iter(train_dataset.take(1)))
-                print(f"After transformation:")
-                print(f"  X shape: {transformed_batch[0].shape}")
-                print(f"  Y shape: {transformed_batch[1].shape}")
-                print(f"  Y sample: {transformed_batch[1][0]}")
-                
-                # Test model compatibility with SINGLE sample to avoid batch issues
-                single_x = transformed_batch[0][:1]  # Take first sample
-                single_y = transformed_batch[1][:1]   # Take first label
-                
-                print(f"  Testing with single sample X shape: {single_x.shape}")
-                print(f"  Testing with single sample Y shape: {single_y.shape}")
-                
-                # Test model prediction within strategy scope
-                with strategy.scope():
-                    test_pred = model(single_x)
-                print(f"  Model prediction shape: {test_pred.shape}")
-                
-                # Check shape compatibility
-                pred_shape = test_pred.shape[1:]
-                label_shape = single_y.shape[1:]
-                compatible = pred_shape == label_shape
-                print(f"  Shapes compatible: {compatible}")
-                
-                if not compatible:
-                    print(f"  Prediction shape: {pred_shape}")
-                    print(f"  Label shape: {label_shape}")
-                    print(f"  ⚠️  Shape mismatch - but training may still work due to automatic broadcasting")
-                else:
-                    print(f"  ✅ Perfect shape match!")
-                
-            except Exception as e:
-                print(f"Transformation validation warning: {e}")
-                # Continue anyway - the model was built successfully so training should work
-    
-    # Optimize datasets
-    train_dataset = train_dataset.prefetch(tf.data.AUTOTUNE)
-    val_dataset = val_dataset.prefetch(tf.data.AUTOTUNE)
-
-    # Setup callbacks
-    time_callback = TimePerEpochCallback()
-    
-    # ✅ ADD: Clean progress callback for better output formatting
-    progress_callback = CleanProgressCallback(verbose=verbose, show_progress_bar=verbose)
-
-    callbacks = [
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(model_best_path),
-            monitor=monitor_metric,
-            mode='max' if 'accuracy' in monitor_metric or 'f1' in monitor_metric else 'min',
-            save_best_only=True,
-            save_weights_only=False,
-            verbose=0
-        ),
-        
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(checkpoint_path),
-            save_freq='epoch',
-            save_weights_only=False,
-            verbose=0
-        ),
-        
-        tf.keras.callbacks.EarlyStopping(
-            monitor=monitor_metric,
-            patience=patience,
-            mode='max' if 'accuracy' in monitor_metric or 'f1' in monitor_metric else 'min',
-            restore_best_weights=True,
-            verbose=0
-        ),
-        
-        time_callback,
-        progress_callback,  # ✅ ADD: Custom progress callback
-        
-        EnhancedCSVLogger(
-            filename=str(csv_log_path),
-            separator=',',
-            append=False
-        ),
-        
-        tf.keras.callbacks.TensorBoard(
-            log_dir=str(tensorboard_path),
-            histogram_freq=0,
-            write_graph=False,
-            write_images=False,
-            update_freq='epoch'
-        ),
-        
-        TimeLimitCallback(max_time_hours=max_time_hours)
-    ]
-    
-    if verbose:
-        print(f"Starting training: {experiment_dir.name}")
-        print(f"Using strategy: {type(strategy).__name__}")
-    
-    # ✅ FIXED: Use verbose=0 to prevent step-by-step metric printing
-    # The custom progress callback will handle epoch-level reporting
-    with strategy.scope():
-        history = model.fit(
-            train_dataset,
-            epochs=epochs,
-            steps_per_epoch=steps_per_epoch,
-            validation_data=val_dataset,
-            validation_steps=validation_steps,
-            callbacks=callbacks,
-            verbose=0  # ✅ Keep verbose=0 to prevent Keras built-in progress output
-        )
-    
-    # Save final model
-    model.save(str(model_final_path))
-    
-    if verbose:
-        avg_time = sum(time_callback.epoch_times) / len(time_callback.epoch_times) if time_callback.epoch_times else 0
-        total_time = sum(time_callback.epoch_times) if time_callback.epoch_times else 0
-        print(f"Training completed: {len(history.history['loss'])} epochs, {total_time/60:.1f}min total, {avg_time:.1f}s/epoch")
-    
-    return model, history, experiment_dir
-
-# Configuración principal
-def run_seizure_pipeline(WINDOW_SIZE=10, FS=256):
-    """Pipeline principal optimizado"""
-    
-    # Configuración
-    config = {
-        'one_hot': ONEHOT,
-        'window_size': WINDOW_SIZE,  # Window size in seconds
-        'fs': FS,  # Sampling frequency
-        'n_timepoints': WINDOW_SIZE * FS,  # Total timepoints per window
-        'n_channels': 22,
-        'batch_size': 16,
-        'learning_rate': 0.001,
-        'epochs': 50,
-        'patience': 10
-    }
-    
-    if verbose_pipeline := True:
-        print(f"Pipeline Configuration:")
-        for key, value in config.items():
-            print(f"  {key}: {value}")
-    
-    # Create TFRecords with validation
-    print("Creating TFRecord files...")
-    definitivo_stats = write_tfrecord_splits_FINAL_CORRECTED(
-        data_dir='DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3',
-        tfrecord_dir='tfrecords',
-        montage='ar',
-        limits={'eval': 10, 'dev': 10},
-        n_workers=2,
-        chunk_size_mb=50,
-        resume=False,
-        validate=True
-    )
-    
-    # Print TFRecord creation stats
-    if definitivo_stats:
-        print(f"TFRecord creation stats: {definitivo_stats}")
-
-    # Get TFRecord files
-    tfrecord_files = list(Path('tfrecords').rglob('*.tfrecord'))
-    if not tfrecord_files:
-        raise FileNotFoundError("No TFRecord files found")
-    
-    if verbose_pipeline:
-        print(f"Found {len(tfrecord_files)} TFRecord files")
-        
-        # Inspect file sizes for better step estimation
-        total_size_mb = 0
-        for f in tfrecord_files:
-            size_mb = f.stat().st_size / (1024 * 1024)
-            total_size_mb += size_mb
-            if verbose_pipeline and len(tfrecord_files) <= 10:  # Only show details for small number of files
-                print(f"  {f.name}: {size_mb:.1f} MB")
-        
-        print(f"Total TFRecord size: {total_size_mb:.1f} MB")
-    
-    # Split files for train/validation
-    split_idx = int(0.8 * len(tfrecord_files))
-    train_files = [str(f) for f in tfrecord_files[:split_idx]]
-    val_files = [str(f) for f in tfrecord_files[split_idx:]]
-    
-    print(f"Training files: {len(train_files)}")
-    print(f"Validation files: {len(val_files)}")
-    
-    # Create optimized datasets
-    train_ds = create_optimized_dataset_pipeline(
-        train_files,
-        n_channels=config['n_channels'],
-        n_timepoints=config['n_timepoints'],
-        batch_size=config['batch_size'],
-        one_hot=config['one_hot'],
-        is_training=True
-    )
-    
-    val_ds = create_optimized_dataset_pipeline(
-        val_files,
-        n_channels=config['n_channels'],
-        n_timepoints=config['n_timepoints'],
-        batch_size=config['batch_size'],
-        one_hot=config['one_hot'],
-        is_training=False
-    )
-    
-    # Better step estimation based on actual data inspection
-    print("Estimating dataset sizes...")
-    
-    # Count samples in a few batches to estimate total
-    try:
-        sample_count = 0
-        for i, batch in enumerate(train_ds.take(5)):
-            batch_size = batch[0].shape[0]
-            sample_count += batch_size
-            if verbose_pipeline:
-                print(f"  Batch {i+1}: {batch_size} samples")
-        
-        # Estimate total samples assuming similar batch sizes
-        if sample_count > 0:
-            avg_batch_size = sample_count / 5
-            # Rough estimation: each file might contain similar amount of data
-            estimated_total_samples = len(train_files) * avg_batch_size * 20  # Conservative multiplier
-            steps_per_epoch = max(10, int(estimated_total_samples // config['batch_size']))
-        else:
-            steps_per_epoch = 100  # Fallback
-            
-    except Exception as e:
-        print(f"Could not estimate dataset size: {e}")
-        steps_per_epoch = 100  # Fallback
-    
-    # Validation steps
-    try:
-        val_sample_count = 0
-        for i, batch in enumerate(val_ds.take(3)):
-            val_sample_count += batch[0].shape[0]
-        
-        if val_sample_count > 0:
-            avg_val_batch_size = val_sample_count / 3
-            estimated_val_samples = len(val_files) * avg_val_batch_size * 20
-            val_steps = max(5, int(estimated_val_samples // config['batch_size']))
-        else:
-            val_steps = 25  # Fallback
-            
-    except Exception as e:
-        print(f"Could not estimate validation size: {e}")
-        val_steps = 25  # Fallback
-    
-    if verbose_pipeline:
-        print(f"Estimated training samples: {steps_per_epoch * config['batch_size']}")
-        print(f"Training steps per epoch: {steps_per_epoch}")
-        print(f"Estimated validation samples: {val_steps * config['batch_size']}")
-        print(f"Validation steps: {val_steps}")
-    
-    # Verify minimum reasonable steps
-    if steps_per_epoch < 10:
-        print(f"Warning: Very few training steps ({steps_per_epoch}). Using minimum of 50.")
-        steps_per_epoch = 50
-        
-    if val_steps < 5:
-        print(f"Warning: Very few validation steps ({val_steps}). Using minimum of 10.")
-        val_steps = 10
-    
-    # ✅ FIXED: Model configuration with proper parameters
-    model_config = {
-        'input_channels': config['n_channels'],
-        'num_filters': 32,
-        'num_blocks': 4,
-        'one_hot': config['one_hot'],
-        'time_step': TIMESTEP,  # Use global TIMESTEP setting
-        'num_classes': 2 if config['one_hot'] else 1,  # Explicit class count
-        'window_length_samples': config['n_timepoints']  # Pass window length
-    }
-    
-    print(f"Model configuration:")
-    print(f"  One-hot: {model_config['one_hot']}")
-    print(f"  Time-step: {model_config['time_step']}")
-    print(f"  Classes: {model_config['num_classes']}")
-    
-    # Train model
-    model, history, experiment_dir = train_seizure_complete_v2(
-        model_config=model_config,
-        train_dataset=train_ds,
-        val_dataset=val_ds,
-        steps_per_epoch=steps_per_epoch,
-        validation_steps=val_steps,
-        epochs=config['epochs'],
-        learning_rate=config['learning_rate'],
-        gamma=2.0,
-        experiment_name='seizure_detection_optimized',
-        monitor_metric='val_balanced_accuracy',
-        patience=config['patience'],
-        max_time_hours=12,
-        onehot=config['one_hot'],
-        verbose=True
-    )
-    
-    if verbose_pipeline:
-        print(f"Training completed. Results saved to: {experiment_dir}")
-        
-        # Print final metrics
-        final_metrics = {k: v[-1] for k, v in history.history.items() if v}
-        print("Final metrics:")
-        for metric, value in final_metrics.items():
-            print(f"  {metric}: {value:.4f}")
-    
-    return model, history, experiment_dir
-
-# ✅ ADD GPU memory setup at module level to ensure it's done early
-def setup_gpu_memory():
-    """Setup GPU memory growth at import time"""
-    try:
-        gpus = tf.config.experimental.list_physical_devices('GPU')
-        if gpus:
-            # Try to enable memory growth for all GPUs
-            for gpu in gpus:
-                tf.config.experimental.set_memory_growth(gpu, True)
-            print(f"✅ GPU memory growth enabled for {len(gpus)} GPU(s)")
-        else:
-            print("ℹ️  No GPUs found")
-    except RuntimeError:
-        # Memory growth must be set before GPUs have been initialized
-        print("ℹ️  GPU memory growth already configured")
-    except Exception as e:
-        print(f"⚠️  GPU memory setup warning: {e}")
-
-# ✅ Call GPU setup at module import
-setup_gpu_memory()
-
-class CleanProgressCallback(tf.keras.callbacks.Callback):
-    """Custom callback for clean epoch-only progress reporting with tqdm-like progress bar"""
-    
-    def __init__(self, verbose=True, show_progress_bar=True):
-        super().__init__()
-        self.verbose = verbose
-        self.show_progress_bar = show_progress_bar
-        self.start_time = None
-        self.epoch_start = None
-        self.current_step = 0
-        self.total_steps = 0
-        
+class SafeTimeCSVLogger(tf.keras.callbacks.Callback):
+    def __init__(self, filename): super().__init__(); self.filename = filename; self.f=None; self.start=None; self.epoch_start=None
     def on_train_begin(self, logs=None):
-        if self.verbose:
-            print("Training started...")
-        self.start_time = time.time()
-    
-    def on_epoch_begin(self, epoch, logs=None):
-        if self.verbose:
-            print(f"\nEpoch {epoch + 1}/{self.params['epochs']}")
-        self.epoch_start = time.time()
-        self.current_step = 0
-        self.total_steps = self.params.get('steps', 0)
-    
-    def on_batch_end(self, batch, logs=None):
-        if not self.show_progress_bar or not self.verbose:
-            return
-            
-        self.current_step = batch + 1
-        
-        # Calculate progress
-        progress = self.current_step / self.total_steps if self.total_steps > 0 else 0
-        bar_length = 30
-        filled_length = int(bar_length * progress)
-        
-        # Create progress bar
-        bar = '█' * filled_length + '░' * (bar_length - filled_length)
-        
-        # Calculate time estimates
-        elapsed = time.time() - self.epoch_start
-        if self.current_step > 0:
-            time_per_step = elapsed / self.current_step
-            eta = time_per_step * (self.total_steps - self.current_step)
-            eta_str = f"{int(eta)}s"
-        else:
-            eta_str = "?s"
-        
-        # Format key metrics from logs
-        metrics_str = ""
-        if logs:
-            key_metrics = ['loss', 'accuracy', 'balanced_accuracy']
-            metric_parts = []
-            for metric in key_metrics:
-                if metric in logs:
-                    metric_parts.append(f"{metric}: {logs[metric]:.4f}")
-            if metric_parts:
-                metrics_str = " - " + " - ".join(metric_parts[:3])  # Limit to 3 metrics
-        
-        # Print progress bar (overwrite same line)
-        progress_text = (f"\r{self.current_step}/{self.total_steps} "
-                        f"[{bar}] "
-                        f"{progress*100:.1f}% "
-                        f"- {int(elapsed)}s - ETA: {eta_str}"
-                        f"{metrics_str}")
-        
-        print(progress_text, end='', flush=True)
-    
+        self.start = time.time(); self.f = open(self.filename, "w", buffering=1)
+        self.f.write("epoch,epoch_time_seconds,total_time_seconds\n")
+    def on_epoch_begin(self, epoch, logs=None): self.epoch_start = time.time()
     def on_epoch_end(self, epoch, logs=None):
-        if not self.verbose:
-            return
-            
-        # Clear the progress bar line
-        if self.show_progress_bar:
-            print()  # New line after progress bar
-            
-        epoch_time = time.time() - self.epoch_start
-        
-        # Format metrics nicely
+        et = time.time() - self.epoch_start; tt = time.time() - self.start
+        self.f.write(f"{epoch},{et:.3f},{tt:.3f}\n")
+    def on_train_end(self, logs=None):
+        if self.f: self.f.close()
+
+class SafeTimeLimitCallback(tf.keras.callbacks.Callback):
+    def __init__(self, max_seconds, grace_seconds=300):
+        super().__init__(); self.max_seconds=max_seconds; self.grace=grace_seconds; self.start=None
+    def on_train_begin(self, logs=None):
+        self.start=time.time(); print(f"⏰ Límite de tiempo: {self.max_seconds/3600:.1f} h")
+    def on_epoch_end(self, epoch, logs=None):
+        if time.time() - self.start > self.max_seconds:
+            print("⏰ Tiempo agotado; deteniendo entrenamiento tras cerrar época."); self.model.stop_training=True
+
+class SafeBackupAndRestore(tf.keras.callbacks.Callback):
+    def __init__(self, backup_dir: Path):
+        super().__init__(); self.dir = Path(backup_dir); self.dir.mkdir(parents=True, exist_ok=True)
+    def on_epoch_end(self, epoch, logs=None):
+        if epoch % 5 == 0 and epoch > 0:
+            path = self.dir / f"backup_epoch_{epoch:03d}.weights.h5"
+            try:
+                self.model.save_weights(str(path))
+                for p in sorted(self.dir.glob("backup_epoch_*.weights.h5"))[:-3]:
+                    p.unlink(missing_ok=True)
+            except Exception as e:
+                print(f"⚠️ Backup warning @epoch {epoch}: {e}")
+
+class ThresholdReportCSV(tf.keras.callbacks.Callback):
+    def __init__(self, run_dir: Path, thresholds, split_keys=("","val_"), filename="reports/threshold_report.csv"):
+        super().__init__()
+        self.thresholds = [float(t) for t in thresholds]
+        self.split_keys = split_keys  # ("", "val_") → train y val
+        self.path = Path(run_dir) / filename
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._header_written = False
+
+    @staticmethod
+    def _get(d, k): 
+        v = d.get(k); 
+        return float(v) if v is not None else float("nan")
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        rows, best_val = [], {"f1": -1, "t": None}
+        for prefix in self.split_keys:  # "" → train, "val_" → val
+            split = "val" if prefix == "val_" else "train"
+            for t in self.thresholds:
+                k = lambda name: f"{prefix}{name}@t={t:.2f}"
+                rec = self._get(logs, k("recall"))
+                spe = self._get(logs, k("specificity"))
+                pre = self._get(logs, k("precision"))
+                tp  = self._get(logs, k("TP"))
+                tn  = self._get(logs, k("TN"))
+                fp  = self._get(logs, k("FP"))
+                fn  = self._get(logs, k("FN"))
+                ba  = self._get(logs, f"{prefix}balanced_accuracy@t={t:.2f}")
+                # F1 a partir de precision/recall si existen
+                denom = (pre + rec) if math.isfinite(pre) and math.isfinite(rec) and (pre+rec)>0 else float("nan")
+                f1 = (2*pre*rec/denom) if math.isfinite(denom) else float("nan")
+                rows.append({
+                    "epoch": epoch+1, "split": split, "t": t,
+                    "tp": tp, "tn": tn, "fp": fp, "fn": fn,
+                    "recall": rec, "specificity": spe, "precision": pre,
+                    "balanced_accuracy": ba, "f1": f1,
+                    # globales del epoch (mismo para todos los t, pero útiles)
+                    "auc_pr": self._get(logs, f"{prefix}auc_pr"),
+                    "auc_roc": self._get(logs, f"{prefix}auc_roc"),
+                    "brier": self._get(logs, f"{prefix}brier_score"),
+                    "loss": self._get(logs, f"{prefix}loss"),
+                })
+                if split == "val" and math.isfinite(f1) and f1 > best_val["f1"]:
+                    best_val = {"f1": f1, "t": t}
+
+        # escribe CSV (append)
+        write_header = not self._header_written and not self.path.exists()
+        with open(self.path, "a", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            if write_header: w.writeheader(); self._header_written = True
+            w.writerows(rows)
+
+        # print resumen del mejor F1 en val
+        if best_val["t"] is not None:
+            print(f"\n🔎 Epoch {epoch+1}: mejor F1(val)={best_val['f1']:.4f} @ t={best_val['t']:.2f}  → {self.path}")
+
+def _sanitize_monitor_for_filename(monitor: str) -> str:
+    s = monitor.lower().replace("val_", "")
+    s = re.sub(r"[^a-z0-9]+", "_", s); s = re.sub(r"_+", "_", s).strip("_")
+    return s
+
+def make_callbacks(run_dir: Path, primary_monitor="val_auc_pr", secondary_monitors=None):
+    run_dir.mkdir(parents=True, exist_ok=True)
+    cbs = [
+        tf.keras.callbacks.CSVLogger(str(run_dir / "training_log.csv")),
+        SafeTimeCSVLogger(str(run_dir / "training_log_with_times.csv")),
+        tf.keras.callbacks.TerminateOnNaN(),
+        tf.keras.callbacks.EarlyStopping(monitor=primary_monitor, mode="max", patience=15, restore_best_weights=True),
+        tf.keras.callbacks.TensorBoard(log_dir=str(run_dir / "tb"), write_graph=False, write_images=False),
+        SafeTimeLimitCallback(TIME_LIMIT_H * 3600, grace_seconds=300),
+        SafeBackupAndRestore(run_dir / "backups"),
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(run_dir / "best_by_primary.weights.h5"),
+            monitor=primary_monitor, mode="max",
+            save_best_only=True, save_weights_only=True
+        ),
+    ]
+    if secondary_monitors:
+        for m in secondary_monitors:
+            cbs.append(tf.keras.callbacks.ModelCheckpoint(
+                filepath=str(run_dir / f"best_by_{_sanitize_monitor_for_filename(m)}.weights.h5"),
+                monitor=m, mode="max", save_best_only=True, save_weights_only=True
+            ))
+    print(f"✅ Callbacks: {len(cbs)} | primary: {primary_monitor} | secondary: {secondary_monitors or []}")
+    return cbs
+
+# === Callback de ETA ligero (imprime cada N s una sola línea por época) ======
+class LightETA(tf.keras.callbacks.Callback):
+    def __init__(self, train_steps, print_every_sec=20, track=("loss", "accuracy")):
+        super().__init__()
+        self.train_steps = int(train_steps) if train_steps else None
+        self.print_every = float(print_every_sec)
+        self.track = tuple(track)
+        self._last = 0.0; self._epoch_start = 0.0; self._batch = 0
+        self._ema = {k: None for k in self.track}
+
+    def _get_lr(self):
+        try:
+            it = int(self.model.optimizer.iterations.numpy())
+            lr = self.model.optimizer.learning_rate
+            if callable(getattr(lr, "__call__", None)):
+                return float(lr(it).numpy())
+            return float(tf.keras.backend.get_value(lr))
+        except Exception:
+            try: return float(tf.keras.backend.get_value(self.model.optimizer.lr))
+            except Exception: return float("nan")
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self._epoch_start = time.time(); self._batch = 0
+        for k in self._ema: self._ema[k] = None
+        print(f"\nEpoch {epoch+1}/{self.params.get('epochs','?')} ...", flush=True)
+        self._last = self._epoch_start
+
+    def on_train_batch_end(self, batch, logs=None):
+        self._batch += 1
+        now = time.time()
         if logs:
-            # Separate training and validation metrics
-            train_metrics = {}
-            val_metrics = {}
-            
-            for key, value in logs.items():
-                if key.startswith('val_'):
-                    val_metrics[key[4:]] = value  # Remove 'val_' prefix
-                elif key not in ['epoch_time', 'epoch_time_minutes', 'avg_epoch_time']:
-                    train_metrics[key] = value
-            
-            # Print training metrics
-            train_parts = []
-            for k, v in train_metrics.items():
-                if isinstance(v, (int, float)):
-                    train_parts.append(f"{k}: {v:.4f}")
-            
-            if train_parts:
-                train_str = " - ".join(train_parts)
-                print(f" {epoch_time:.0f}s - {train_str}")
-            
-            # Print validation metrics if available
-            if val_metrics:
-                val_parts = []
-                for k, v in val_metrics.items():
-                    if isinstance(v, (int, float)):
-                        val_parts.append(f"val_{k}: {v:.4f}")
-                
-                if val_parts:
-                    val_str = " - ".join(val_parts)
-                    print(f" Validation: {val_str}")
+            for k in self.track:
+                v = logs.get(k)
+                if v is not None:
+                    prev = self._ema[k]
+                    self._ema[k] = v if prev is None else (0.9*prev + 0.1*v)
+        if now - self._last >= self.print_every and self.train_steps:
+            elapsed = now - self._epoch_start
+            done = min(self._batch, self.train_steps)
+            speed = done / elapsed if elapsed > 0 else 0.0
+            remain = (self.train_steps - done) / speed if speed > 0 else float("inf")
+            lr = self._get_lr()
+            mets = " ".join(f"{k}={self._ema[k]:.4f}" for k in self.track if self._ema[k] is not None)
+            print(
+                f"\r  {done:>5}/{self.train_steps:<5} "
+                f"({done/self.train_steps:5.1%})  "
+                f"ETA {remain/60:5.1f}m  "
+                f"spd {speed:4.1f} it/s  "
+                f"lr {lr:.2e}  {mets}",
+                end="", flush=True
+            )
+            self._last = now
+
+    def on_epoch_end(self, epoch, logs=None):
+        elapsed = time.time() - self._epoch_start
+        mets = " ".join(f"{k}={logs.get(k):.4f}" for k in self.track if logs and k in logs)
+        print(f"\r  done in {elapsed:5.1f}s  {mets}".ljust(100), flush=True)
+
+# ========================= DATASETS ==========================================
+def make_datasets(tfrecord_dir: str, n_channels: int, n_timepoints: int):
+    train_glob = os.path.join(tfrecord_dir, 'train', '*.tfrecord')
+    val_glob   = os.path.join(tfrecord_dir, 'val',   '*.tfrecord')
+
+    def _resolve(pat):
+        if '*' in pat:
+            files = sorted(glob.glob(pat)); return files or []
+        return [pat] if os.path.exists(pat) else []
+
+    train_files = _resolve(train_glob) or _resolve(os.path.join(tfrecord_dir, 'train.tfrecord'))
+    val_files   = _resolve(val_glob)   or _resolve(os.path.join(tfrecord_dir, 'val.tfrecord'))
+
+    if not train_files:
+        raise FileNotFoundError(f"No se encontraron TFRecords de entrenamiento en {tfrecord_dir}")
+
+    train_ds = create_dataset_final(
+        train_files, n_channels=n_channels, n_timepoints=n_timepoints,
+        batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
+        shuffle=True, balance_pos_frac=BALANCE_POS_FRAC
+    )
+    val_ds = create_dataset_final(
+        val_files or train_files, n_channels=n_channels, n_timepoints=n_timepoints,
+        batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
+        shuffle=False, balance_pos_frac=None
+    )
+    return train_ds, val_ds
+
+def inspect_dataset(ds, batches=None, pos_label=1):
+    tot, pos = 0, 0
+    it = ds if batches is None else ds.take(batches)
+    for _, y in it:
+        y = y.numpy()
+        if y.ndim > 1 and y.shape[-1] > 1:  # one-hot
+            y = np.argmax(y, axis=-1)
+        tot += y.size
+        pos += int((y == pos_label).sum())
+    prev = (pos / tot) if tot else 0.0
+    print(f"Dataset windows: {tot} | positivos: {pos} ({prev:.2%})")
+
+# ========================= PIPELINE PRINCIPAL ================================
+def pipeline(data_root: str, n_channels=22):
+    # TFRecords
+    if WRITE_TFREC:
+        print("🎯 PIPELINE DEFINITIVO CORREGIDO:", TFRECORD_DIR)
+        write_tfrecord_splits_FINAL_CORRECTED(
+            data_root, TFRECORD_DIR, montage='ar',
+            resample_fs=FS_TARGET, limits=LIMITS,
+            window_sec=WINDOW_SEC, hop_sec=FRAME_HOP_SEC
+        )
+
+    n_timepoints = int(WINDOW_SEC * FS_TARGET)
+    train_ds, val_ds = make_datasets(TFRECORD_DIR, n_channels, n_timepoints)
+
+    # Sanidad rápida
+    inspect_dataset(train_ds, batches=10)
+    inspect_dataset(val_ds,   batches=10)
+
+    # Dataset infinito + pasos explícitos (robusto)
+    # Creamos datasets "contables" sin shuffle para cardinalidad
+    count_train_ds = create_dataset_final(
+        glob.glob(os.path.join(TFRECORD_DIR, 'train', '*.tfrecord')) or [os.path.join(TFRECORD_DIR, 'train.tfrecord')],
+        n_channels=n_channels, n_timepoints=n_timepoints,
+        batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
+        shuffle=False, balance_pos_frac=None
+    )
+    count_val_ds = create_dataset_final(
+        glob.glob(os.path.join(TFRECORD_DIR, 'val', '*.tfrecord')) or [os.path.join(TFRECORD_DIR, 'val.tfrecord')],
+        n_channels=n_channels, n_timepoints=n_timepoints,
+        batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
+        shuffle=False, balance_pos_frac=None
+    )
+    steps_per_epoch  = cardinality_safe(count_train_ds)
+    val_steps        = cardinality_safe(count_val_ds)
+
+    train_ds = train_ds.repeat()
+    val_ds   = val_ds.repeat()
+
+    # LR schedule
+    total_steps = max(1, EPOCHS * steps_per_epoch)
+    lr_sched = WarmupCosineSchedule(
+        base_lr=LEARNING_RATE, total_steps=total_steps,
+        warmup_ratio=WARMUP_RATIO, min_lr_frac=MIN_LR_FRAC
+    )
+
+    # Optimizer AdamW
+    try:
+        optimizer = tf.keras.optimizers.AdamW(learning_rate=lr_sched, weight_decay=WEIGHT_DECAY, use_ema=False)
+    except TypeError:
+        optimizer = tf.keras.optimizers.AdamW(learning_rate=lr_sched, weight_decay=WEIGHT_DECAY)
+
+    # Modelo
+    num_classes = 2 if ONEHOT else 1
+    model = build_tcn(
+        input_shape=(n_timepoints, n_channels),
+        num_classes=num_classes,
+        one_hot=ONEHOT, time_step=TIME_STEP,
+        separable=True, use_squeeze_excitation=True, use_gelu=True
+    )
+
+    # Métricas y pérdida
+    metrics = make_metrics(ONEHOT)
+    loss_fn = make_loss(ONEHOT)
+
+    model.compile(
+        optimizer=optimizer,
+        loss=loss_fn,
+        metrics=metrics,
+        jit_compile=True
+    )
+
+    # Monitores secundarios automáticos si no se definieron explícitamente
+    sec_mons = list(SECONDARY_MONITORS)
+    if not sec_mons:
+        for s in SENS_AT_SPEC_TARGETS:
+            sec_mons.append(f"val_{_mn_sens_at_spec(s)}")
+        for s in SPEC_AT_SENS_TARGETS:
+            sec_mons.append(f"val_{_mn_spec_at_sens(s)}")
+        for t in THRESHOLDS[:1]:
+            sec_mons.extend([
+                f"val_{_mn_recall_t(t)}",
+                f"val_{_mn_spec_t(t)}",
+                f"val_{_mn_tp_t(t)}",
+                f"val_{_mn_tn_t(t)}",
+                f"val_{_mn_fp_t(t)}",
+                f"val_{_mn_fn_t(t)}",
+            ])
+
+    callbacks = make_callbacks(
+        RUN_DIR,
+        primary_monitor=PRIMARY_MONITOR if PRIMARY_MONITOR.startswith("val_") else f"val_{PRIMARY_MONITOR}",
+        secondary_monitors=sec_mons
+    )
+
+    # ETA ligero (imprime cada 20 s una línea dentro de la época)
+    eta_cb = LightETA(train_steps=steps_per_epoch, print_every_sec=20, track=("loss","accuracy"))
+
+    print(f"🚀 Entrenando — modo: {'ONEHOT' if ONEHOT else 'BINARIO'} | TIME_STEP={TIME_STEP}")
+    report_cb = ThresholdReportCSV(RUN_DIR, thresholds=THRESHOLDS, filename="reports/threshold_report.csv")
+    hist = model.fit(
+        train_ds, validation_data=val_ds,
+        steps_per_epoch=steps_per_epoch, validation_steps=val_steps,
+        epochs=EPOCHS,
+        callbacks=callbacks + [eta_cb, report_cb],
+        verbose=2
+    )
+
+    # Guardados finales (portables)
+    final_base = RUN_DIR / "final_model"
+    model.save(str(final_base) + ".keras", include_optimizer=False)  # arquitectura + pesos
+    model.save_weights(str(final_base) + ".weights.h5")              # solo pesos
+    print(f"✅ Guardado: {final_base}.keras  y  {final_base}.weights.h5")
+    return model, hist
+
+# ================================ MAIN =======================================
+if __name__ == "__main__":
+    data_root = 'DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3'
+    pipeline(data_root=data_root, n_channels=22)
