@@ -334,86 +334,133 @@ def make_balanced_stream(ds, one_hot: bool, time_step: bool, target_pos_frac: fl
         stop_on_empty_dataset=False  # Continue even if one stream is empty
     )
 
-def create_dataset_final(tfrecord_files, n_channels, n_timepoints, batch_size, 
-                        one_hot=False, time_step=False, balance_pos_frac=None, 
-                        cache=False, drop_remainder=False, shuffle=False):
+def create_dataset_final(
+    tfrecord_files,
+    n_channels,
+    n_timepoints,
+    batch_size,
+    one_hot=False,
+    time_step=False,
+    balance_pos_frac=None,
+    cache=False,
+    drop_remainder=False,
+    shuffle=False,
+    shuffle_buffer=4096,
+):
     """
-    Versión final corregida que maneja todos los casos
-    """
-    import tensorflow as tf
-    
-    dataset = tf.data.TFRecordDataset(tfrecord_files)
-    
-    def parse_fn_final(example_proto):
-        feature_desc = {
-            'eeg': tf.io.VarLenFeature(tf.float32),
-            'labels': tf.io.VarLenFeature(tf.int64),
-            'patient_id': tf.io.FixedLenFeature([], tf.string, default_value=''),
-            'record_id': tf.io.FixedLenFeature([], tf.string, default_value=''),
-            'duration_sec': tf.io.FixedLenFeature([], tf.float32, default_value=0.0)
-        }
-        
-        parsed = tf.io.parse_single_example(example_proto, feature_desc)
-        
-        # EEG data
-        eeg_flat = tf.sparse.to_dense(parsed['eeg'])
-        expected_eeg_size = n_channels * n_timepoints
-        eeg_size = tf.shape(eeg_flat)[0]
-        
-        # Ajustar EEG al tamaño esperado
-        eeg_flat = tf.cond(
-            eeg_size >= expected_eeg_size,
-            lambda: eeg_flat[:expected_eeg_size],
-            lambda: tf.pad(eeg_flat, [[0, expected_eeg_size - eeg_size]])
-        )
-        eeg = tf.reshape(eeg_flat, [n_channels, n_timepoints])
-        eeg = tf.transpose(eeg, [1, 0])  # Convert from (channels, time) to (time, channels)
-        
-        # Labels - versión simplificada sin tf.cond problemático
-        labels_flat = tf.sparse.to_dense(parsed['labels'])
-        
-        if time_step:
-            # Para time_step, necesitamos n_timepoints etiquetas
-            # Si solo tenemos 1 etiqueta, la replicamos
-            if tf.shape(labels_flat)[0] == 1:
-                # Replicar la etiqueta para todos los timepoints
-                labels = tf.fill([n_timepoints], labels_flat[0])
-            else:
-                # Si tenemos más etiquetas, tomar las primeras n_timepoints
-                labels = labels_flat[:n_timepoints]
-                # Si son menos, hacer padding
-                if tf.shape(labels)[0] < n_timepoints:
-                    padding_needed = n_timepoints - tf.shape(labels)[0]
-                    labels = tf.pad(labels, [[0, padding_needed]])
-        else:
-            # Para no time_step, una sola etiqueta por ventana
-            labels = tf.reduce_max(labels_flat) if tf.shape(labels_flat)[0] > 0 else tf.constant(0, dtype=tf.int64)
-        
-        # Convertir a int32 para one_hot (si es necesario)
-        labels_int32 = tf.cast(labels, tf.int32)
-        
-        # Aplicar one-hot si se solicita
-        if one_hot:
-            labels = tf.one_hot(labels_int32, depth=2)
-        else:
-            labels = tf.cast(labels_int32, tf.int64)  # Mantener como int64 para consistencia
-        
-        return eeg, labels
-    
-    dataset = dataset.map(parse_fn_final, num_parallel_calls=tf.data.AUTOTUNE)
-    if balance_pos_frac is not None:
-        dataset = dataset.sample(
-            weights=[balance_pos_frac, 1.0 - balance_pos_frac],
-            seed=42,
-            stop_on_empty_dataset=False  # Continue even if one stream is empty
-        )
-    dataset = dataset.batch(batch_size, drop_remainder=drop_remainder)
-    if shuffle:
-        dataset = dataset.shuffle(buffer_size=1000)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-    
-    return dataset
+    Dataset con formas *estáticas* para Keras/XLA:
 
+      X  -> (T, C)  float32
+      Y  -> (según configuración):
+         - BINARIO + TIME_STEP=True  -> (T, 1) float32 en {0,1}
+         - ONEHOT  + TIME_STEP=True  -> (T, 2) float32 (one-hot)
+         - BINARIO + TIME_STEP=False -> (1,)   float32 en {0,1}
+         - ONEHOT  + TIME_STEP=False -> (2,)   float32 (one-hot)
+
+    Notas:
+      - Garantizamos padding/truncado a (T,C) y (T,[1|2]).
+      - Las shapes se fijan con tf.ensure_shape(...) → JIT friendly.
+      - `drop_remainder=True` en el batch asegura tamaño fijo por iteración.
+    """
+
+    feature_desc = {
+        "eeg": tf.io.VarLenFeature(tf.float32),
+        "labels": tf.io.VarLenFeature(tf.int64),
+        "patient_id": tf.io.FixedLenFeature([], tf.string, default_value=""),
+        "record_id": tf.io.FixedLenFeature([], tf.string, default_value=""),
+        "duration_sec": tf.io.FixedLenFeature([], tf.float32, default_value=0.0),
+    }
+
+    T = int(n_timepoints)
+    C = int(n_channels)
+
+    def _parse(example_proto):
+        parsed = tf.io.parse_single_example(example_proto, feature_desc)
+
+        # ---------- EEG → (T, C) ----------
+        eeg_flat = tf.sparse.to_dense(parsed["eeg"])  # (N,)
+        expected = tf.constant(T * C, dtype=tf.int32)
+        size = tf.shape(eeg_flat)[0]
+
+        eeg_flat = tf.cond(
+            size >= expected,
+            lambda: eeg_flat[:expected],
+            lambda: tf.pad(eeg_flat, [[0, expected - size]]),
+        )
+        x = tf.reshape(eeg_flat, [T, C])
+        x = tf.cast(x, tf.float32)
+        x = tf.ensure_shape(x, [T, C])  # <- fija shape estática
+
+        # ---------- LABELS ----------
+        labels_flat = tf.sparse.to_dense(parsed["labels"])  # (L,)
+        L = tf.shape(labels_flat)[0]
+
+        if time_step:
+            # Queremos un vector de longitud T con {0,1} (o one-hot)
+            # Caso L==0 o L==1: replicar (0 o la única etiqueta)
+            def _replicate_one():
+                val = tf.cond(
+                    L > 0,
+                    lambda: tf.cast(labels_flat[0], tf.int32),
+                    lambda: tf.constant(0, tf.int32),
+                )
+                return tf.fill([T], val)
+
+            # Caso L>=2: truncar/pad a T
+            def _fit_to_T():
+                y = tf.cast(labels_flat, tf.int32)
+                y = y[:T]
+                need = T - tf.shape(y)[0]
+                return tf.cond(need > 0, lambda: tf.pad(y, [[0, need]]), lambda: y)
+
+            y_int = tf.cond(L <= 1, _replicate_one, _fit_to_T)  # (T,)
+
+            if one_hot:
+                y = tf.one_hot(y_int, depth=2)
+                y = tf.cast(y, tf.float32)
+                y = tf.ensure_shape(y, [T, 2])  # <- fija shape estática
+            else:
+                y = tf.cast(y_int, tf.float32)
+                y = tf.reshape(y, [T, 1])
+                y = tf.ensure_shape(y, [T, 1])  # <- fija shape estática
+
+        else:
+            # Ventana: una etiqueta por ejemplo
+            y_int = tf.cond(
+                L > 0,
+                lambda: tf.reduce_max(tf.cast(labels_flat, tf.int32)),
+                lambda: tf.constant(0, tf.int32),
+            )
+            if one_hot:
+                y = tf.one_hot(y_int, depth=2)
+                y = tf.cast(y, tf.float32)
+                y = tf.ensure_shape(y, [2])  # <- fija shape estática
+            else:
+                y = tf.cast(y_int, tf.float32)
+                y = tf.reshape(y, [1])
+                y = tf.ensure_shape(y, [1])  # <- fija shape estática
+
+        return x, y
+
+    ds = tf.data.TFRecordDataset(tfrecord_files, num_parallel_reads=tf.data.AUTOTUNE)
+
+    if shuffle:
+        ds = ds.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
+
+    ds = ds.map(_parse, num_parallel_calls=tf.data.AUTOTUNE)
+
+    if cache:
+        ds = ds.cache()
+
+    # ⚠️ Mantengo tu API: si usas balanceo especial, insértalo aquí.
+    if balance_pos_frac is not None:
+        # Placeholder NO-OP. Si tienes una implementación propia de sample(),
+        # colócala aquí con cuidado de no romper las shapes.
+        pass
+
+    ds = ds.batch(batch_size, drop_remainder=drop_remainder)  # <- asegura batch fijo
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds
 
 # =================================================================================================================
 # 🎯 PIPELINE DEFINITIVO CON FUNCIÓN CORREGIDA

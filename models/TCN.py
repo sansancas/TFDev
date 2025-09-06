@@ -6,15 +6,20 @@ class CausalPadding1D(layers.Layer):
     
     def __init__(self, padding_size, **kwargs):
         super().__init__(**kwargs)
-        self.padding_size = padding_size
+        self.padding_size = int(padding_size)
     
     def call(self, x):
         return tf.pad(x, [[0, 0], [self.padding_size, 0], [0, 0]])
     
+    def compute_output_shape(self, input_shape):
+        b, t, c = input_shape
+        t_out = None if t is None else t + self.padding_size
+        return (b, t_out, c)
+    
     def get_config(self):
-        config = super().get_config()
-        config.update({'padding_size': self.padding_size})
-        return config
+        cfg = super().get_config()
+        cfg.update({'padding_size': self.padding_size})
+        return cfg
 
 class SqueezeExcitation1D(layers.Layer):
     """Squeeze-and-Excitation ligero compatible con XLA/JIT"""
@@ -29,6 +34,7 @@ class SqueezeExcitation1D(layers.Layer):
         self.fc1 = layers.Dense(self.hidden, activation='relu', use_bias=False)
         self.fc2 = layers.Dense(channels, activation='sigmoid', use_bias=False)
         self.reshape = layers.Reshape((1, channels))
+        self.mul = layers.Multiply()
     
     def call(self, x):
         # Squeeze
@@ -38,7 +44,7 @@ class SqueezeExcitation1D(layers.Layer):
         s = self.fc2(s)
         s = self.reshape(s)
         # Scale
-        return tf.multiply(x, s)
+        return self.mul([x, s])
     
     def get_config(self):
         config = super().get_config()
@@ -80,6 +86,11 @@ def build_tcn(input_shape,
               use_squeeze_excitation=False,
               use_gelu=True):
     
+    if one_hot and num_classes != 2:
+        raise ValueError("one_hot=True requiere num_classes=2.")
+    if not one_hot and num_classes != 1:
+        raise ValueError("one_hot=False requiere num_classes=1.")
+
     # define the input layer
     dtype = 'float32' if hpc else None
     inputs = layers.Input(shape=input_shape, dtype=dtype)
@@ -115,7 +126,7 @@ def build_tcn(input_shape,
                           kernel_initializer='he_normal',
                           use_bias=False,
                           name=f"conv2_block{i+1}")(x)
-        x = layers.LayerNormalization(name=f"ln1_block{i+1}")(x)
+        x = layers.LayerNormalization(dtype="float32", name=f"ln1_block{i+1}")(x)
         x = layers.SpatialDropout1D(rate=dropout_rate,
                                     name=f"drop1_block{i+1}")(x)
 
@@ -142,7 +153,7 @@ def build_tcn(input_shape,
                           use_bias=False,
                           name=f"conv1_block{i+1}")(x)
         
-        x = layers.LayerNormalization(name=f"ln2_block{i+1}")(x)
+        x = layers.LayerNormalization(dtype="float32", name=f"ln2_block{i+1}")(x)
         x = layers.Activation(activation, name=f"{activation}_block{i+1}")(x)
         x = layers.SpatialDropout1D(rate=dropout_rate,
                                     name=f"drop2_block{i+1}")(x)
@@ -173,8 +184,9 @@ def build_tcn(input_shape,
             skip = residual
         
         # Ajustar longitudes para conexión residual usando capa personalizada
-        x_aligned, skip_aligned = TemporalAlignment(name=f"align_block{i+1}")([x, skip])
-        x = layers.Add(name=f"add_block{i+1}")([x_aligned, skip_aligned])
+        # x_aligned, skip_aligned = TemporalAlignment(name=f"align_block{i+1}")([x, skip])
+        # x = layers.Add(name=f"add_block{i+1}")([x_aligned, skip_aligned])
+        x = layers.Add(name=f"add_block{i+1}")([x, skip])
 
     # classification head
     if time_step:

@@ -12,6 +12,7 @@ from pathlib import Path
 from datetime import datetime
 import numpy as np
 import tensorflow as tf
+from models.jit_model import JITModel
 
 # ========================== CONFIG GLOBAL ====================================
 ONEHOT        = False          # True: salida one-hot (2 clases); False: binaria (1 salida)
@@ -26,7 +27,8 @@ WARMUP_RATIO  = 0.1            # fracción de pasos para warmup
 MIN_LR_FRAC   = 0.05           # mínimo relativo en CosineDecay
 WEIGHT_DECAY  = 1e-3
 TIME_LIMIT_H  = 48
-LIMITS        = {'train': 30, 'dev': 2, 'eval': 2}
+LIMITS        = {'train': 250, 'dev': 75, 'eval': 75}
+# LIMITS        = {'train': 50, 'dev': 10, 'eval': 10}
 WRITE_TFREC   = True
 BALANCE_POS_FRAC = None        # si tu create_dataset_final lo soporta (p.ej. 0.5)
 
@@ -39,14 +41,16 @@ SPEC_AT_SENS_TARGETS    = [0.90]          # especificidad a sensibilidad objetiv
 PRIMARY_MONITOR         = "val_auc_pr"
 SECONDARY_MONITORS      = []  # si vacío, se autollenan según listas de arriba
 
+STEP_MULT=32
+
 # Dirs (ajusta a tu estructura)
-FULL_REC = '../records2' if ONEHOT else '../bin_records2'
-CUT_REC  = '../records_cut2' if ONEHOT else '../bin_records_cut2'
+FULL_REC = './records2' if ONEHOT else './bin_records2'
+CUT_REC  = './records_cut2' if ONEHOT else './bin_records_cut2'
 TFRECORD_DIR = CUT_REC
 RUNS_DIR = Path("./runs")
 RUN_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 RUN_DIR = RUNS_DIR / f"eeg_seizures_{RUN_STAMP}"
-
+LIGHT_TRAIN_METRICS = False
 # ======================= IMPORTA DATASET Y MODELO ============================
 from dataset import write_tfrecord_splits_FINAL_CORRECTED, create_dataset_final
 from models.TCN import build_tcn
@@ -68,182 +72,219 @@ np.random.seed(42); tf.random.set_seed(42)
 # Desactivar barra interactiva (usamos verbose=2 + LightETA)
 tf.keras.utils.disable_interactive_logging()
 
-# ====================== UTILIDADES DE FORMAS =================================
-def _norm_shapes(y_true, y_pred, is_onehot: bool):
-    """
-    Devuelve y_true, y_pred en tf.float32 y compatibles.
-    - Si ONEHOT: colapsa a prob/etiqueta de clase positiva (índice 1).
-    - Si TIME_STEP: replica y_true cuando venga sin eje temporal.
-    """
-    y_true = tf.cast(y_true, tf.float32)
-    y_pred = tf.cast(y_pred, tf.float32)
+# ---------- Helper: normaliza a vectores binarios 1D ----------
+def _to_binary_vectors(y_true, y_pred):
+    yt = tf.cast(y_true, tf.float32)
+    yp = tf.cast(y_pred, tf.float32)
 
-    # Manejo del eje temporal si aparece en y_pred
-    if len(y_pred.shape) == 3:  # (B,T,C/1)
-        if len(y_true.shape) == 1:
-            y_true = tf.expand_dims(y_true, 1)                 # (B,1)
-            y_true = tf.tile(y_true, [1, tf.shape(y_pred)[1]]) # (B,T)
-        elif len(y_true.shape) == 2 and (is_onehot and y_true.shape[-1] == 2):
-            y_true = tf.expand_dims(y_true, 1)                      # (B,1,2)
-            y_true = tf.tile(y_true, [1, tf.shape(y_pred)[1], 1])   # (B,T,2)
-        if y_pred.shape[-1] == 1:
-            y_pred = tf.squeeze(y_pred, -1)                    # (B,T)
+    # y_pred -> prob de clase positiva
+    if yp.shape.rank is not None and yp.shape.rank >= 1:
+        last = yp.shape[-1]
+        if last == 2:
+            yp = yp[..., 1]
+        elif last == 1:
+            yp = tf.squeeze(yp, axis=-1)
 
-    if len(y_pred.shape) == 2 and y_pred.shape[-1] == 1:
-        y_pred = tf.squeeze(y_pred, -1)                        # (B,)
+    # y_true -> etiqueta binaria 0/1
+    if yt.shape.rank is not None and yt.shape.rank >= 1:
+        last = yt.shape[-1]
+        if last == 2:
+            yt = yt[..., 1]
+        elif last == 1:
+            yt = tf.squeeze(yt, axis=-1)
 
-    # Selección de clase positiva
-    if is_onehot:
-        if len(y_true.shape) >= 2 and y_true.shape[-1] == 2:
-            y_true = y_true[..., 1]
-        if len(y_pred.shape) >= 2 and y_pred.shape[-1] == 2:
-            y_pred = y_pred[..., 1]
+    yt = tf.reshape(yt, [-1])
+    yp = tf.reshape(yp, [-1])
+    return yt, yp
 
-    return y_true, y_pred
-
-def _binarize01(t):  # por si etiquetas llegan como floats
-    return tf.cast(t >= 0.5, tf.float32)
 
 # ================= MÉTRICAS PERSONALIZADAS / WRAPPERS ========================
 class BalancedAccuracy(tf.keras.metrics.Metric):
-    """BA = 0.5*(TPR + TNR) a umbral fijo (threshold)."""
-    def __init__(self, threshold=0.5, name="balanced_accuracy", **kw):
-        super().__init__(name=name, **kw)
+    """BA = 0.5*(TPR + TNR) a umbral fijo."""
+    def __init__(self, threshold=0.5, name="balanced_accuracy", dtype=tf.float32, **kwargs):
+        super().__init__(name=name, dtype=dtype, **kwargs)
         self.th = float(threshold)
-        self.tp = self.add_weight(name="tp", shape=(), initializer="zeros", dtype="float32")
-        self.tn = self.add_weight(name="tn", shape=(), initializer="zeros", dtype="float32")
-        self.fp = self.add_weight(name="fp", shape=(), initializer="zeros", dtype="float32")
-        self.fn = self.add_weight(name="fn", shape=(), initializer="zeros", dtype="float32")
+        self.tp = self.add_weight(name="tp", shape=(), initializer="zeros", dtype=self.dtype)
+        self.tn = self.add_weight(name="tn", shape=(), initializer="zeros", dtype=self.dtype)
+        self.fp = self.add_weight(name="fp", shape=(), initializer="zeros", dtype=self.dtype)
+        self.fn = self.add_weight(name="fn", shape=(), initializer="zeros", dtype=self.dtype)
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true, y_pred = _norm_shapes(y_true, y_pred, is_onehot=ONEHOT)
-        y_true = _binarize01(y_true)
-        y_hat = tf.cast(y_pred >= self.th, tf.float32)
-        tp = y_hat * y_true
-        tn = (1.0 - y_hat) * (1.0 - y_true)
-        fp = y_hat * (1.0 - y_true)
-        fn = (1.0 - y_hat) * y_true
-        if sample_weight is not None:
-            sw = tf.cast(sample_weight, tf.float32)
-            tp, tn, fp, fn = sw*tp, sw*tn, sw*fp, sw*fn
-        self.tp.assign_add(tf.reduce_sum(tp))
-        self.tn.assign_add(tf.reduce_sum(tn))
-        self.fp.assign_add(tf.reduce_sum(fp))
-        self.fn.assign_add(tf.reduce_sum(fn))
+        yt, yp = _to_binary_vectors(y_true, y_pred)
+        ytb = yt >= 0.5
+        ypb = yp >= self.th
+
+        tp = tf.reduce_sum(tf.cast(tf.logical_and(ytb, ypb), self.dtype))
+        fn = tf.reduce_sum(tf.cast(tf.logical_and(ytb, tf.logical_not(ypb)), self.dtype))
+        tn = tf.reduce_sum(tf.cast(tf.logical_and(tf.logical_not(ytb), tf.logical_not(ypb)), self.dtype))
+        fp = tf.reduce_sum(tf.cast(tf.logical_and(tf.logical_not(ytb), ypb), self.dtype))
+
+        self.tp.assign_add(tp); self.fn.assign_add(fn)
+        self.tn.assign_add(tn); self.fp.assign_add(fp)
 
     def result(self):
         tpr = tf.math.divide_no_nan(self.tp, self.tp + self.fn)
         tnr = tf.math.divide_no_nan(self.tn, self.tn + self.fp)
         return 0.5 * (tpr + tnr)
 
-    def reset_states(self):
+    def reset_state(self):
         for v in (self.tp, self.tn, self.fp, self.fn):
             v.assign(0.0)
 
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"threshold": self.th})
+        return cfg
+
+
 class BrierScore(tf.keras.metrics.Metric):
-    """Brier score (prob. clase positiva vs etiqueta binaria 0/1)."""
-    def __init__(self, name="brier_score", **kw):
-        super().__init__(name=name, **kw)
-        self.sum_err = self.add_weight(name="sum_err", shape=(), initializer="zeros", dtype="float32")
-        self.count   = self.add_weight(name="count",   shape=(), initializer="zeros", dtype="float32")
+    """Brier score (MSE de probas de clase positiva)."""
+    def __init__(self, name="brier_score", dtype=tf.float32, **kwargs):
+        super().__init__(name=name, dtype=dtype, **kwargs)
+        self.sum_err = self.add_weight(name="sum_err", shape=(), initializer="zeros", dtype=self.dtype)
+        self.count   = self.add_weight(name="count",   shape=(), initializer="zeros", dtype=self.dtype)
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true, y_pred = _norm_shapes(y_true, y_pred, is_onehot=ONEHOT)
-        y_true = _binarize01(y_true)
-        err = tf.square(y_pred - y_true)
-        if sample_weight is not None:
-            err = err * tf.cast(sample_weight, tf.float32)
+        yt, yp = _to_binary_vectors(y_true, y_pred)
+        err = tf.square(yp - yt)
         self.sum_err.assign_add(tf.reduce_sum(err))
-        self.count.assign_add(tf.cast(tf.size(err), tf.float32))
+        self.count.assign_add(tf.cast(tf.size(yt), self.dtype))
 
     def result(self):
         return tf.math.divide_no_nan(self.sum_err, self.count)
 
-    def reset_states(self):
-        self.sum_err.assign(0.0)
-        self.count.assign(0.0)
+    def reset_state(self):
+        self.sum_err.assign(0.0); self.count.assign(0.0)
+
 
 class SpecificityAtThreshold(tf.keras.metrics.Metric):
     """Especificidad (TNR) a umbral fijo."""
-    def __init__(self, threshold=0.5, name=None, **kw):
-        name = name or f"specificity@t={threshold:.2f}"
-        super().__init__(name=name, **kw)
+    def __init__(self, threshold=0.5, name=None, dtype=tf.float32, **kwargs):
+        super().__init__(name=name or f"specificity@t={threshold:.2f}", dtype=dtype, **kwargs)
         self.th = float(threshold)
-        self.tn = self.add_weight(name="tn", shape=(), initializer="zeros", dtype="float32")
-        self.fp = self.add_weight(name="fp", shape=(), initializer="zeros", dtype="float32")
+        self.tn = self.add_weight(name="tn", shape=(), initializer="zeros", dtype=self.dtype)
+        self.fp = self.add_weight(name="fp", shape=(), initializer="zeros", dtype=self.dtype)
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true, y_pred = _norm_shapes(y_true, y_pred, is_onehot=ONEHOT)
-        y_true = _binarize01(y_true)
-        y_hat  = tf.cast(y_pred >= self.th, tf.float32)
-        tn = (1.0 - y_hat) * (1.0 - y_true)
-        fp = y_hat * (1.0 - y_true)
-        if sample_weight is not None:
-            sw = tf.cast(sample_weight, tf.float32)
-            tn, fp = sw*tn, sw*fp
-        self.tn.assign_add(tf.reduce_sum(tn))
-        self.fp.assign_add(tf.reduce_sum(fp))
+        yt, yp = _to_binary_vectors(y_true, y_pred)
+        ytb = yt >= 0.5
+        ypb = yp >= self.th
 
-    def result(self):  # TNR
+        tn = tf.reduce_sum(tf.cast(tf.logical_and(tf.logical_not(ytb), tf.logical_not(ypb)), self.dtype))
+        fp = tf.reduce_sum(tf.cast(tf.logical_and(tf.logical_not(ytb), ypb), self.dtype))
+
+        self.tn.assign_add(tn); self.fp.assign_add(fp)
+
+    def result(self):
         return tf.math.divide_no_nan(self.tn, self.tn + self.fp)
 
-    def reset_states(self):
+    def reset_state(self):
         self.tn.assign(0.0); self.fp.assign(0.0)
+
+    def get_config(self):
+        cfg = super().get_config()
+        cfg.update({"threshold": self.th})
+        return cfg
+
+class AUCfp32(tf.keras.metrics.AUC):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true = tf.cast(y_true, tf.float32)
+        y_pred = tf.cast(y_pred, tf.float32)
+        return super().update_state(y_true, y_pred, sample_weight)
+
+class SensAtSpec_fp32(tf.keras.metrics.SensitivityAtSpecificity):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        return super().update_state(tf.cast(y_true, tf.float32), tf.cast(y_pred, tf.float32), sample_weight)
+
+class SpecAtSens_fp32(tf.keras.metrics.SpecificityAtSensitivity):
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        return super().update_state(tf.cast(y_true, tf.float32), tf.cast(y_pred, tf.float32), sample_weight)
 
 class ShapeAwareWrapper(tf.keras.metrics.Metric):
     """
-    Envuelve una métrica Keras aplicando _norm_shapes primero.
-    Útil para Recall/Precision con thresholds, TP/TN/FP/FN y
-    SensitivityAtSpecificity / SpecificityAtSensitivity.
+    Envuelve una métrica Keras aplicando vectorización binaria 1D antes.
+    Útil para Recall/Precision con thresholds y Sensitivity/Specificity nativas.
     """
-    def __init__(self, inner_metric, name=None):
-        super().__init__(name=name or inner_metric.name)
+    def __init__(self, inner_metric, name=None, dtype=tf.float32, apply_vectorize=True, **kwargs):
+        super().__init__(name=name or getattr(inner_metric, "name", "wrapped_metric"), dtype=dtype, **kwargs)
         self.inner = inner_metric
+        self.apply_vectorize = bool(apply_vectorize)
 
     def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true, y_pred = _norm_shapes(y_true, y_pred, is_onehot=ONEHOT)
-        return self.inner.update_state(y_true, y_pred, sample_weight)
+        if self.apply_vectorize:
+            yt, yp = _to_binary_vectors(y_true, y_pred)
+        else:
+            yt, yp = y_true, y_pred
+        return self.inner.update_state(yt, yp, sample_weight=sample_weight)
 
-    def result(self): return self.inner.result()
-    def reset_states(self): return self.inner.reset_states()
+    def result(self):
+        return self.inner.result()
 
+    def reset_state(self):
+        if hasattr(self.inner, "reset_state"):
+            self.inner.reset_state()
+
+    def get_config(self):
+        cfg = super().get_config()
+        try:
+            inner_cfg = tf.keras.utils.serialize_keras_object(self.inner)
+        except Exception:
+            inner_cfg = {"class_name": self.inner.__class__.__name__,
+                         "config": getattr(self.inner, "get_config", lambda: {})()}
+        cfg.update({"inner_metric": inner_cfg, "apply_vectorize": self.apply_vectorize})
+        return cfg
+
+    @classmethod
+    def from_config(cls, config):
+        inner_cfg = config.pop("inner_metric", None)
+        apply_vectorize = config.get("apply_vectorize", True)
+        inner = None
+        if isinstance(inner_cfg, dict) and "class_name" in inner_cfg:
+            try:
+                inner = tf.keras.utils.deserialize_keras_object(inner_cfg)
+            except Exception:
+                inner = None
+        return cls(inner_metric=inner, apply_vectorize=apply_vectorize, **config)
+    
 # ======================== PÉRDIDAS ===========================================
 try:
     from tensorflow.keras.losses import BinaryFocalCrossentropy, CategoricalFocalCrossentropy
     HAVE_FOCAL = True
 except Exception:
     HAVE_FOCAL = False
-
+print(HAVE_FOCAL)
 def make_loss(is_onehot: bool):
     if is_onehot:
+        loss_obj = (CategoricalFocalCrossentropy(alpha=[0.25, 0.75], gamma=2.0, label_smoothing=0.1)
+                    if HAVE_FOCAL else
+                    tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05))
         def loss(y_true, y_pred):
-            if TIME_STEP and len(y_pred.shape) == 3 and len(y_true.shape) == 2:
-                y_true2 = tf.expand_dims(y_true, 1)
-                y_true2 = tf.tile(y_true2, [1, tf.shape(y_pred)[1], 1])
+            if TIME_STEP and y_true.shape.rank == 2 and y_pred.shape.rank == 3:
+                # (B,2) → (B,T,2) usando broadcast (XLA‑friendly)
+                y_true2 = tf.broadcast_to(tf.expand_dims(y_true, axis=1), tf.shape(y_pred))
             else:
                 y_true2 = y_true
-            if HAVE_FOCAL:
-                return CategoricalFocalCrossentropy(alpha=[0.25, 0.75], gamma=2.0, label_smoothing=0.1)(y_true2, y_pred)
-            else:
-                return tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05)(y_true2, y_pred)
+            return loss_obj(y_true2, y_pred)
         return loss
     else:
+        loss_obj = (BinaryFocalCrossentropy(alpha=0.75, gamma=2.0, label_smoothing=0.1)
+                    if HAVE_FOCAL else
+                    tf.keras.losses.BinaryCrossentropy(label_smoothing=0.05))
         def loss(y_true, y_pred):
-            if TIME_STEP and len(y_pred.shape) == 3 and y_pred.shape[-1] == 1:
-                y_pred2 = tf.squeeze(y_pred, -1)
-            else:
-                y_pred2 = y_pred
-            if TIME_STEP and len(y_true.shape) == 1 and len(y_pred2.shape) == 2:
-                y_true2 = tf.expand_dims(y_true, 1)
-                y_true2 = tf.tile(y_true2, [1, tf.shape(y_pred2)[1]])
-            else:
-                y_true2 = y_true
-            if HAVE_FOCAL:
-                return BinaryFocalCrossentropy(alpha=0.75, gamma=2.0, label_smoothing=0.1)(y_true2, y_pred2)
-            else:
-                return tf.keras.losses.BinaryCrossentropy(label_smoothing=0.05)(y_true2, y_pred2)
+            # y_pred esperado (B,T,1) → (B,T)
+            yp = y_pred
+            if yp.shape.rank == 3 and yp.shape[-1] == 1:
+                yp = tf.squeeze(yp, axis=-1)
+            # y_true puede venir como (B,), (B,1), (B,T) o (B,T,1) → forzamos (B,T)
+            yt = tf.cast(y_true, yp.dtype)
+            if yt.shape.rank == 3 and yt.shape[-1] == 1:
+                yt = tf.squeeze(yt, axis=-1)                   # (B,T)
+            elif yt.shape.rank == 1:
+                yt = tf.expand_dims(yt, axis=-1)               # (B,1)
+            # ahora broadcast a (B,T) (sirve tanto si es (B,1) como si ya es (B,T))
+            yt = tf.broadcast_to(yt, [tf.shape(yp)[0], tf.shape(yp)[1]])
+            return loss_obj(yt, yp)
         return loss
-
 # ======================== NOMBRES DE MÉTRICAS =================================
 def _mn_sens_at_spec(s): return f"sens@spec>={s:.2f}"
 def _mn_spec_at_sens(s): return f"spec@sens>={s:.2f}"
@@ -258,15 +299,14 @@ def _mn_prec_t(t):       return f"precision@t={t:.2f}"
 
 # ======================== MÉTRICAS ===========================================
 def make_metrics(is_onehot: bool):
-    mets = []
-    # Accuracy apropiada según salida
-    if is_onehot: mets += [tf.keras.metrics.CategoricalAccuracy(name="accuracy")]
-    else:         mets += [tf.keras.metrics.BinaryAccuracy(name="accuracy")]
-
-    # PR / ROC
-    mets += [tf.keras.metrics.AUC(curve="PR", name="auc_pr"),
-             tf.keras.metrics.AUC(curve="ROC", name="auc_roc")]
-
+    
+    base = []
+    if is_onehot: base += [tf.keras.metrics.CategoricalAccuracy(name="accuracy")]
+    else:         base += [tf.keras.metrics.BinaryAccuracy(name="accuracy")]
+    base += [AUCfp32(curve="PR", name="auc_pr"), AUCfp32(curve="ROC", name="auc_roc")]
+    if LIGHT_TRAIN_METRICS:
+        return base
+    else: mets = base
     # Versiones a umbral fijo + cuentas de la matriz de confusión
     for t in THRESHOLDS:
         mets += [ShapeAwareWrapper(tf.keras.metrics.Recall(thresholds=[t]),    name=_mn_recall_t(t))]
@@ -294,33 +334,54 @@ def make_metrics(is_onehot: bool):
     return mets
 
 # ============== LR schedule: Warmup + CosineDecay serializable ================
+import math
+import tensorflow as tf
+
 @tf.keras.utils.register_keras_serializable(package="sched")
 class WarmupCosineSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+    """
+    LR = 
+      - base_lr * (step / warmup_steps)                    si step < warmup_steps
+      - min_lr + (base_lr - min_lr) * 0.5*(1 + cos(pi*z))  en otro caso,
+        z = clip((step - warmup_steps) / (total_steps - warmup_steps), 0..1)
+    """
     def __init__(self, base_lr, total_steps, warmup_ratio=0.1, min_lr_frac=0.05, name=None):
         super().__init__()
-        self.base_lr = float(base_lr)
-        self.total_steps = int(max(1, total_steps))
+        # Guarda parámetros como float/int nativos (serializables)
+        self.base_lr      = float(base_lr)
+        self.total_steps  = int(max(1, total_steps))
         self.warmup_ratio = float(warmup_ratio)
-        self.min_lr_frac = float(min_lr_frac)
+        self.min_lr_frac  = float(min_lr_frac)
+        self._name        = name or "WarmupCosineSchedule"
 
-        self.warmup_steps = int(max(1, self.warmup_ratio * self.total_steps))
-        self.decay_steps  = int(max(1, self.total_steps - self.warmup_steps))
-        self.min_lr = self.base_lr * self.min_lr_frac
-
-        self.cosine = tf.keras.optimizers.schedules.CosineDecay(
-            initial_learning_rate=self.base_lr,
-            decay_steps=self.decay_steps,
-            alpha=self.min_lr / self.base_lr
-        )
-        self._name = name or "WarmupCosineSchedule"
+        # Precalcula enteros/floats estáticos (NO tensores) en __init__
+        self.warmup_steps = int(max(1, round(self.warmup_ratio * self.total_steps)))
+        self.decay_steps  = max(1, self.total_steps - self.warmup_steps)
+        self.min_lr       = float(self.base_lr * self.min_lr_frac)
 
     def __call__(self, step):
-        step = tf.cast(step, tf.int32)
-        def _warm():
-            return self.base_lr * tf.cast(step, tf.float32) / float(self.warmup_steps)
-        def _cos():
-            return self.cosine(tf.cast(step - self.warmup_steps, tf.float32))
-        return tf.cond(step < self.warmup_steps, _warm, _cos)
+        # Asegura dtype consistente para XLA
+        step_f   = tf.cast(step, tf.float32)
+        warm_f   = tf.constant(float(self.warmup_steps), dtype=tf.float32)
+        total_f  = tf.constant(float(self.total_steps),  dtype=tf.float32)
+        base_f   = tf.constant(self.base_lr,             dtype=tf.float32)
+        minlr_f  = tf.constant(self.min_lr,              dtype=tf.float32)
+        one      = tf.constant(1.0,                      dtype=tf.float32)
+        pi       = tf.constant(math.pi,                  dtype=tf.float32)
+
+        # Warmup lineal (evita división por 0)
+        warm_denom = tf.maximum(one, warm_f)
+        warm_lr    = base_f * (step_f / warm_denom)
+
+        # Cosine decay desde min_lr a base_lr
+        decay_denom = tf.maximum(one, total_f - warm_f)
+        progress    = tf.clip_by_value((step_f - warm_f) / decay_denom, 0.0, 1.0)
+        cosine      = 0.5 * (one + tf.cos(pi * progress))
+        decay_lr    = minlr_f + (base_f - minlr_f) * cosine
+
+        # Selección sin funciones anidadas (mejor para XLA)
+        lr = tf.where(step_f < warm_f, warm_lr, decay_lr)
+        return lr
 
     def get_config(self):
         return {
@@ -424,6 +485,7 @@ class ThresholdReportCSV(tf.keras.callbacks.Callback):
 
         # escribe CSV (append)
         write_header = not self._header_written and not self.path.exists()
+        import csv
         with open(self.path, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             if write_header: w.writeheader(); self._header_written = True
@@ -465,11 +527,13 @@ def make_callbacks(run_dir: Path, primary_monitor="val_auc_pr", secondary_monito
 
 # === Callback de ETA ligero (imprime cada N s una sola línea por época) ======
 class LightETA(tf.keras.callbacks.Callback):
-    def __init__(self, train_steps, print_every_sec=20, track=("loss", "accuracy")):
+    def __init__(self, train_steps, print_every_sec=20, track=("loss","accuracy"),
+                 step_multiplier=1):  # <-- nuevo
         super().__init__()
         self.train_steps = int(train_steps) if train_steps else None
         self.print_every = float(print_every_sec)
         self.track = tuple(track)
+        self.step_multiplier = int(step_multiplier)
         self._last = 0.0; self._epoch_start = 0.0; self._batch = 0
         self._ema = {k: None for k in self.track}
 
@@ -491,7 +555,7 @@ class LightETA(tf.keras.callbacks.Callback):
         self._last = self._epoch_start
 
     def on_train_batch_end(self, batch, logs=None):
-        self._batch += 1
+        self._batch += self.step_multiplier
         now = time.time()
         if logs:
             for k in self.track:
@@ -540,12 +604,12 @@ def make_datasets(tfrecord_dir: str, n_channels: int, n_timepoints: int):
     train_ds = create_dataset_final(
         train_files, n_channels=n_channels, n_timepoints=n_timepoints,
         batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
-        shuffle=True, balance_pos_frac=BALANCE_POS_FRAC
+        shuffle=True, balance_pos_frac=BALANCE_POS_FRAC, drop_remainder=True,
     )
     val_ds = create_dataset_final(
         val_files or train_files, n_channels=n_channels, n_timepoints=n_timepoints,
         batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
-        shuffle=False, balance_pos_frac=None
+        shuffle=False, balance_pos_frac=None, drop_remainder=True,
     )
     return train_ds, val_ds
 
@@ -585,13 +649,13 @@ def pipeline(data_root: str, n_channels=22):
         glob.glob(os.path.join(TFRECORD_DIR, 'train', '*.tfrecord')) or [os.path.join(TFRECORD_DIR, 'train.tfrecord')],
         n_channels=n_channels, n_timepoints=n_timepoints,
         batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
-        shuffle=False, balance_pos_frac=None
+        shuffle=False, balance_pos_frac=None, drop_remainder=True,
     )
     count_val_ds = create_dataset_final(
         glob.glob(os.path.join(TFRECORD_DIR, 'val', '*.tfrecord')) or [os.path.join(TFRECORD_DIR, 'val.tfrecord')],
         n_channels=n_channels, n_timepoints=n_timepoints,
         batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
-        shuffle=False, balance_pos_frac=None
+        shuffle=False, balance_pos_frac=None, drop_remainder=True,
     )
     steps_per_epoch  = cardinality_safe(count_train_ds)
     val_steps        = cardinality_safe(count_val_ds)
@@ -612,14 +676,17 @@ def pipeline(data_root: str, n_channels=22):
     except TypeError:
         optimizer = tf.keras.optimizers.AdamW(learning_rate=lr_sched, weight_decay=WEIGHT_DECAY)
 
+    
     # Modelo
     num_classes = 2 if ONEHOT else 1
     model = build_tcn(
         input_shape=(n_timepoints, n_channels),
         num_classes=num_classes,
         one_hot=ONEHOT, time_step=TIME_STEP,
-        separable=True, use_squeeze_excitation=True, use_gelu=True
+        separable=True, use_squeeze_excitation=False, use_gelu=True
     )
+
+    model = JITModel(inputs=model.inputs, outputs=model.outputs, name=model.name)
 
     # Métricas y pérdida
     metrics = make_metrics(ONEHOT)
@@ -629,7 +696,9 @@ def pipeline(data_root: str, n_channels=22):
         optimizer=optimizer,
         loss=loss_fn,
         metrics=metrics,
-        jit_compile=True
+        # jit_compile=True,
+        run_eagerly=False,
+        steps_per_execution=STEP_MULT,
     )
 
     # Monitores secundarios automáticos si no se definieron explícitamente
@@ -656,7 +725,7 @@ def pipeline(data_root: str, n_channels=22):
     )
 
     # ETA ligero (imprime cada 20 s una línea dentro de la época)
-    eta_cb = LightETA(train_steps=steps_per_epoch, print_every_sec=20, track=("loss","accuracy"))
+    eta_cb = LightETA(train_steps=steps_per_epoch, print_every_sec=20, track=("loss","accuracy"), step_multiplier=STEP_MULT)
 
     print(f"🚀 Entrenando — modo: {'ONEHOT' if ONEHOT else 'BINARIO'} | TIME_STEP={TIME_STEP}")
     report_cb = ThresholdReportCSV(RUN_DIR, thresholds=THRESHOLDS, filename="reports/threshold_report.csv")
@@ -677,5 +746,5 @@ def pipeline(data_root: str, n_channels=22):
 
 # ================================ MAIN =======================================
 if __name__ == "__main__":
-    data_root = 'DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3'
+    data_root = '../DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3'
     pipeline(data_root=data_root, n_channels=22)
