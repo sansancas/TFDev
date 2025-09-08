@@ -13,12 +13,14 @@ from datetime import datetime
 import numpy as np
 import tensorflow as tf
 from models.jit_model import JITModel
+from dataset import WINDOW_FEATURES_DIM
 
 # ========================== CONFIG GLOBAL ====================================
 ONEHOT        = False          # True: salida one-hot (2 clases); False: binaria (1 salida)
-TIME_STEP     = True           # True: salida (B,T,C/1); False: (B,C/1)
+TIME_STEP     = False           # True: salida (B,T,C/1); False: (B,C/1)
+WINDOW_MODE   = "features"          # "default" | "soft" | "features" (solo aplica si TIME_STEP=False)
 WINDOW_SEC    = 5.0
-FRAME_HOP_SEC = 3.0
+FRAME_HOP_SEC = 1.0
 FS_TARGET     = 256
 BATCH_SIZE    = 8
 EPOCHS        = 100
@@ -27,8 +29,8 @@ WARMUP_RATIO  = 0.1            # fracción de pasos para warmup
 MIN_LR_FRAC   = 0.05           # mínimo relativo en CosineDecay
 WEIGHT_DECAY  = 1e-3
 TIME_LIMIT_H  = 48
-LIMITS        = {'train': 250, 'dev': 75, 'eval': 75}
-# LIMITS        = {'train': 50, 'dev': 10, 'eval': 10}
+# LIMITS        = {'train': 200, 'dev': 75, 'eval': 75}
+LIMITS        = {'train': 500, 'dev': 100, 'eval': 100}
 WRITE_TFREC   = True
 BALANCE_POS_FRAC = None        # si tu create_dataset_final lo soporta (p.ej. 0.5)
 
@@ -41,8 +43,6 @@ SPEC_AT_SENS_TARGETS    = [0.90]          # especificidad a sensibilidad objetiv
 PRIMARY_MONITOR         = "val_auc_pr"
 SECONDARY_MONITORS      = []  # si vacío, se autollenan según listas de arriba
 
-STEP_MULT=32
-
 # Dirs (ajusta a tu estructura)
 FULL_REC = './records2' if ONEHOT else './bin_records2'
 CUT_REC  = './records_cut2' if ONEHOT else './bin_records_cut2'
@@ -51,6 +51,7 @@ RUNS_DIR = Path("./runs")
 RUN_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 RUN_DIR = RUNS_DIR / f"eeg_seizures_{RUN_STAMP}"
 LIGHT_TRAIN_METRICS = False
+
 # ======================= IMPORTA DATASET Y MODELO ============================
 from dataset import write_tfrecord_splits_FINAL_CORRECTED, create_dataset_final
 from models.TCN import build_tcn
@@ -202,24 +203,24 @@ class SpecAtSens_fp32(tf.keras.metrics.SpecificityAtSensitivity):
 
 class ShapeAwareWrapper(tf.keras.metrics.Metric):
     """
-    Envuelve una métrica Keras aplicando vectorización binaria 1D antes.
-    Útil para Recall/Precision con thresholds y Sensitivity/Specificity nativas.
+    Envuelve una métrica Keras: vectoriza y opcionalmente binariza y_true (>=0.5).
+    Útil para Recall/Precision a umbral y Sens/Spec nativas cuando hay soft labels.
     """
-    def __init__(self, inner_metric, name=None, dtype=tf.float32, apply_vectorize=True, **kwargs):
+    def __init__(self, inner_metric, name=None, dtype=tf.float32, apply_vectorize=True, binarize_true=True, **kwargs):
         super().__init__(name=name or getattr(inner_metric, "name", "wrapped_metric"), dtype=dtype, **kwargs)
         self.inner = inner_metric
         self.apply_vectorize = bool(apply_vectorize)
+        self.binarize_true = bool(binarize_true)
 
     def update_state(self, y_true, y_pred, sample_weight=None):
+        yt, yp = (y_true, y_pred)
         if self.apply_vectorize:
-            yt, yp = _to_binary_vectors(y_true, y_pred)
-        else:
-            yt, yp = y_true, y_pred
+            yt, yp = _to_binary_vectors(yt, yp)
+        if self.binarize_true:
+            yt = tf.cast(yt >= 0.5, tf.float32)
         return self.inner.update_state(yt, yp, sample_weight=sample_weight)
 
-    def result(self):
-        return self.inner.result()
-
+    def result(self): return self.inner.result()
     def reset_state(self):
         if hasattr(self.inner, "reset_state"):
             self.inner.reset_state()
@@ -231,28 +232,22 @@ class ShapeAwareWrapper(tf.keras.metrics.Metric):
         except Exception:
             inner_cfg = {"class_name": self.inner.__class__.__name__,
                          "config": getattr(self.inner, "get_config", lambda: {})()}
-        cfg.update({"inner_metric": inner_cfg, "apply_vectorize": self.apply_vectorize})
+        cfg.update({"inner_metric": inner_cfg, "apply_vectorize": self.apply_vectorize, "binarize_true": self.binarize_true})
         return cfg
 
     @classmethod
     def from_config(cls, config):
         inner_cfg = config.pop("inner_metric", None)
-        apply_vectorize = config.get("apply_vectorize", True)
-        inner = None
-        if isinstance(inner_cfg, dict) and "class_name" in inner_cfg:
-            try:
-                inner = tf.keras.utils.deserialize_keras_object(inner_cfg)
-            except Exception:
-                inner = None
-        return cls(inner_metric=inner, apply_vectorize=apply_vectorize, **config)
-    
+        inner = tf.keras.utils.deserialize_keras_object(inner_cfg) if isinstance(inner_cfg, dict) and "class_name" in inner_cfg else None
+        return cls(inner_metric=inner, **config)
+          
 # ======================== PÉRDIDAS ===========================================
 try:
     from tensorflow.keras.losses import BinaryFocalCrossentropy, CategoricalFocalCrossentropy
     HAVE_FOCAL = True
 except Exception:
     HAVE_FOCAL = False
-print(HAVE_FOCAL)
+
 def make_loss(is_onehot: bool):
     if is_onehot:
         loss_obj = (CategoricalFocalCrossentropy(alpha=[0.25, 0.75], gamma=2.0, label_smoothing=0.1)
@@ -527,13 +522,11 @@ def make_callbacks(run_dir: Path, primary_monitor="val_auc_pr", secondary_monito
 
 # === Callback de ETA ligero (imprime cada N s una sola línea por época) ======
 class LightETA(tf.keras.callbacks.Callback):
-    def __init__(self, train_steps, print_every_sec=20, track=("loss","accuracy"),
-                 step_multiplier=1):  # <-- nuevo
+    def __init__(self, train_steps, print_every_sec=20, track=("loss", "accuracy")):
         super().__init__()
         self.train_steps = int(train_steps) if train_steps else None
         self.print_every = float(print_every_sec)
         self.track = tuple(track)
-        self.step_multiplier = int(step_multiplier)
         self._last = 0.0; self._epoch_start = 0.0; self._batch = 0
         self._ema = {k: None for k in self.track}
 
@@ -555,7 +548,7 @@ class LightETA(tf.keras.callbacks.Callback):
         self._last = self._epoch_start
 
     def on_train_batch_end(self, batch, logs=None):
-        self._batch += self.step_multiplier
+        self._batch += 1
         now = time.time()
         if logs:
             for k in self.track:
@@ -604,12 +597,14 @@ def make_datasets(tfrecord_dir: str, n_channels: int, n_timepoints: int):
     train_ds = create_dataset_final(
         train_files, n_channels=n_channels, n_timepoints=n_timepoints,
         batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
-        shuffle=True, balance_pos_frac=BALANCE_POS_FRAC, drop_remainder=True,
+        shuffle=True, balance_pos_frac=BALANCE_POS_FRAC,
+        drop_remainder=True, window_mode=WINDOW_MODE
     )
     val_ds = create_dataset_final(
         val_files or train_files, n_channels=n_channels, n_timepoints=n_timepoints,
         batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
-        shuffle=False, balance_pos_frac=None, drop_remainder=True,
+        shuffle=False, balance_pos_frac=None,
+        drop_remainder=True, window_mode=WINDOW_MODE
     )
     return train_ds, val_ds
 
@@ -619,9 +614,11 @@ def inspect_dataset(ds, batches=None, pos_label=1):
     for _, y in it:
         y = y.numpy()
         if y.ndim > 1 and y.shape[-1] > 1:  # one-hot
-            y = np.argmax(y, axis=-1)
+            y_hard = (np.argmax(y, axis=-1) == pos_label)
+        else:
+            y_hard = (y > 0.5)  # soporta 'soft' y 'default'
         tot += y.size
-        pos += int((y == pos_label).sum())
+        pos += int(y_hard.sum())
     prev = (pos / tot) if tot else 0.0
     print(f"Dataset windows: {tot} | positivos: {pos} ({prev:.2%})")
 
@@ -638,6 +635,12 @@ def pipeline(data_root: str, n_channels=22):
 
     n_timepoints = int(WINDOW_SEC * FS_TARGET)
     train_ds, val_ds = make_datasets(TFRECORD_DIR, n_channels, n_timepoints)
+
+    # Canales efectivos del modelo
+    if (not TIME_STEP) and (WINDOW_MODE == "features"):
+        n_channels_eff = n_channels + WINDOW_FEATURES_DIM
+    else:
+        n_channels_eff = n_channels
 
     # Sanidad rápida
     inspect_dataset(train_ds, batches=10)
@@ -680,10 +683,10 @@ def pipeline(data_root: str, n_channels=22):
     # Modelo
     num_classes = 2 if ONEHOT else 1
     model = build_tcn(
-        input_shape=(n_timepoints, n_channels),
+        input_shape=(n_timepoints, n_channels_eff),
         num_classes=num_classes,
         one_hot=ONEHOT, time_step=TIME_STEP,
-        separable=True, use_squeeze_excitation=False, use_gelu=True
+        separable=True, use_squeeze_excitation=True, use_gelu=True
     )
 
     model = JITModel(inputs=model.inputs, outputs=model.outputs, name=model.name)
@@ -698,7 +701,7 @@ def pipeline(data_root: str, n_channels=22):
         metrics=metrics,
         # jit_compile=True,
         run_eagerly=False,
-        steps_per_execution=STEP_MULT,
+        steps_per_execution=1,
     )
 
     # Monitores secundarios automáticos si no se definieron explícitamente
@@ -725,7 +728,7 @@ def pipeline(data_root: str, n_channels=22):
     )
 
     # ETA ligero (imprime cada 20 s una línea dentro de la época)
-    eta_cb = LightETA(train_steps=steps_per_epoch, print_every_sec=20, track=("loss","accuracy"), step_multiplier=STEP_MULT)
+    eta_cb = LightETA(train_steps=steps_per_epoch, print_every_sec=20, track=("loss","accuracy"))
 
     print(f"🚀 Entrenando — modo: {'ONEHOT' if ONEHOT else 'BINARIO'} | TIME_STEP={TIME_STEP}")
     report_cb = ThresholdReportCSV(RUN_DIR, thresholds=THRESHOLDS, filename="reports/threshold_report.csv")

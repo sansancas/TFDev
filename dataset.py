@@ -22,6 +22,7 @@ TRANSPOSE = True
 NOTCH = True
 BANDPASS = True
 NORMALIZE = True
+WINDOW_FEATURES_DIM = 6
 
 # =================================================================================================================
 # Montage-based CSV listing & filtering
@@ -334,113 +335,148 @@ def make_balanced_stream(ds, one_hot: bool, time_step: bool, target_pos_frac: fl
         stop_on_empty_dataset=False  # Continue even if one stream is empty
     )
 
+# --- al inicio de dataset.py (o en un bloque de constantes) ---
+WINDOW_FEATURES_DIM = 6  # número fijo de features agregadas por ventana en 'features' mode
+
+# ----------------- create_dataset_final CON MODOS DE VENTANA -----------------
 def create_dataset_final(
-    tfrecord_files,
-    n_channels,
-    n_timepoints,
-    batch_size,
-    one_hot=False,
-    time_step=False,
-    balance_pos_frac=None,
-    cache=False,
-    drop_remainder=False,
-    shuffle=False,
-    shuffle_buffer=4096,
+    tfrecord_files, n_channels, n_timepoints, batch_size,
+    one_hot=False, time_step=False, balance_pos_frac=None,
+    cache=False, drop_remainder=False, shuffle=False, shuffle_buffer=4096,
+    window_mode="default"  # "default" | "soft" | "features" (solo aplica si time_step=False)
 ):
     """
-    Dataset con formas *estáticas* para Keras/XLA:
-
-      X  -> (T, C)  float32
-      Y  -> (según configuración):
-         - BINARIO + TIME_STEP=True  -> (T, 1) float32 en {0,1}
-         - ONEHOT  + TIME_STEP=True  -> (T, 2) float32 (one-hot)
-         - BINARIO + TIME_STEP=False -> (1,)   float32 en {0,1}
-         - ONEHOT  + TIME_STEP=False -> (2,)   float32 (one-hot)
-
-    Notas:
-      - Garantizamos padding/truncado a (T,C) y (T,[1|2]).
-      - Las shapes se fijan con tf.ensure_shape(...) → JIT friendly.
-      - `drop_remainder=True` en el batch asegura tamaño fijo por iteración.
+    Dataset final con formas estables para Keras/XLA:
+      X -> (T, C) o (T, C + WINDOW_FEATURES_DIM) si window_mode='features'
+      Y -> (B,1) binario o (B,2) one-hot en modo ventana (default);
+           (B,1)/(B,2) con suave [0..1] en 'soft';
+           (B,1)/(B,2) duro en 'features'.
     """
+    import tensorflow as tf
 
     feature_desc = {
-        "eeg": tf.io.VarLenFeature(tf.float32),
-        "labels": tf.io.VarLenFeature(tf.int64),
-        "patient_id": tf.io.FixedLenFeature([], tf.string, default_value=""),
-        "record_id": tf.io.FixedLenFeature([], tf.string, default_value=""),
-        "duration_sec": tf.io.FixedLenFeature([], tf.float32, default_value=0.0),
+        'eeg': tf.io.VarLenFeature(tf.float32),
+        'labels': tf.io.VarLenFeature(tf.int64),
+        'patient_id': tf.io.FixedLenFeature([], tf.string, default_value=''),
+        'record_id': tf.io.FixedLenFeature([], tf.string, default_value=''),
+        'duration_sec': tf.io.FixedLenFeature([], tf.float32, default_value=0.0),
     }
 
-    T = int(n_timepoints)
-    C = int(n_channels)
+    wm = tf.convert_to_tensor(window_mode)  # para usar en tf.cond si hace falta
+
+    def _labels_to_vector_T(labels_flat):
+        """Devuelve vector (T,) int32: replica/trunca/padea a n_timepoints."""
+        L = tf.shape(labels_flat)[0]
+        def _replicate_one():
+            return tf.fill([n_timepoints], tf.cast(labels_flat[0], tf.int32))
+        def _fit_to_T():
+            y = tf.cast(labels_flat, tf.int32)
+            y = y[:n_timepoints]
+            need = n_timepoints - tf.shape(y)[0]
+            return tf.cond(need > 0, lambda: tf.pad(y, [[0, need]]), lambda: y)
+        return tf.cond(L <= 1, _replicate_one, _fit_to_T)  # (T,)
+
+    def _window_features(eeg_tc, labels_T):
+        """
+        Calcula 6 features escalares por ventana y las devuelve como (WINDOW_FEATURES_DIM,)
+        - frac_pos: fracción de frames positivos
+        - n_transitions: número de cambios 0<->1
+        - n_onsets: conteo de 0->1
+        - n_offsets: conteo de 1->0
+        - rms_eeg: sqrt(mean(x^2)) global
+        - mad_eeg: mean(|x - mean(x)|) global
+        """
+        x = tf.cast(eeg_tc, tf.float32)              # (T, C)
+        y = tf.cast(labels_T, tf.float32)            # (T,)
+
+        # Etiquetas
+        frac_pos = tf.reduce_mean(y)                 # [0,1]
+        if n_timepoints > 1:
+            prev = y[:-1]
+            curr = y[1:]
+            changes = tf.cast(tf.not_equal(prev, curr), tf.float32)
+            n_transitions = tf.reduce_sum(changes)
+            onsets  = tf.reduce_sum(tf.cast(tf.logical_and(tf.equal(prev, 0.0), tf.equal(curr, 1.0)), tf.float32))
+            offsets = tf.reduce_sum(tf.cast(tf.logical_and(tf.equal(prev, 1.0), tf.equal(curr, 0.0)), tf.float32))
+        else:
+            n_transitions = tf.constant(0.0, tf.float32)
+            onsets = tf.constant(0.0, tf.float32)
+            offsets = tf.constant(0.0, tf.float32)
+
+        # EEG (globales muy baratas)
+        rms_eeg = tf.sqrt(tf.reduce_mean(tf.square(x)))
+        mad_eeg = tf.reduce_mean(tf.abs(x - tf.reduce_mean(x)))
+
+        feats = tf.stack([frac_pos, n_transitions, onsets, offsets, rms_eeg, mad_eeg], axis=0)
+        feats = tf.ensure_shape(feats, [WINDOW_FEATURES_DIM])
+        return feats  # (F,)
 
     def _parse(example_proto):
         parsed = tf.io.parse_single_example(example_proto, feature_desc)
 
-        # ---------- EEG → (T, C) ----------
-        eeg_flat = tf.sparse.to_dense(parsed["eeg"])  # (N,)
-        expected = tf.constant(T * C, dtype=tf.int32)
+        # ---- EEG -> (T, C) ----
+        eeg_flat = tf.sparse.to_dense(parsed['eeg'])  # (N,)
+        expected = n_channels * n_timepoints
         size = tf.shape(eeg_flat)[0]
-
         eeg_flat = tf.cond(
             size >= expected,
             lambda: eeg_flat[:expected],
-            lambda: tf.pad(eeg_flat, [[0, expected - size]]),
+            lambda: tf.pad(eeg_flat, [[0, expected - size]])
         )
-        x = tf.reshape(eeg_flat, [T, C])
-        x = tf.cast(x, tf.float32)
-        x = tf.ensure_shape(x, [T, C])  # <- fija shape estática
+        eeg = tf.reshape(eeg_flat, [n_timepoints, n_channels])
+        eeg = tf.cast(eeg, tf.float32)
+        eeg = tf.ensure_shape(eeg, [n_timepoints, n_channels])  # XLA-friendly
 
-        # ---------- LABELS ----------
-        labels_flat = tf.sparse.to_dense(parsed["labels"])  # (L,)
-        L = tf.shape(labels_flat)[0]
+        # ---- LABELS ----
+        labels_flat = tf.sparse.to_dense(parsed['labels'])  # (L,)
+        labels_T = _labels_to_vector_T(labels_flat)         # (T,) int32
 
         if time_step:
-            # Queremos un vector de longitud T con {0,1} (o one-hot)
-            # Caso L==0 o L==1: replicar (0 o la única etiqueta)
-            def _replicate_one():
-                val = tf.cond(
-                    L > 0,
-                    lambda: tf.cast(labels_flat[0], tf.int32),
-                    lambda: tf.constant(0, tf.int32),
-                )
-                return tf.fill([T], val)
-
-            # Caso L>=2: truncar/pad a T
-            def _fit_to_T():
-                y = tf.cast(labels_flat, tf.int32)
-                y = y[:T]
-                need = T - tf.shape(y)[0]
-                return tf.cond(need > 0, lambda: tf.pad(y, [[0, need]]), lambda: y)
-
-            y_int = tf.cond(L <= 1, _replicate_one, _fit_to_T)  # (T,)
-
+            # No modificamos el modo frame-by-frame (no solicitado)
             if one_hot:
-                y = tf.one_hot(y_int, depth=2)
+                y = tf.one_hot(labels_T, depth=2)           # (T,2)
                 y = tf.cast(y, tf.float32)
-                y = tf.ensure_shape(y, [T, 2])  # <- fija shape estática
+                y = tf.ensure_shape(y, [n_timepoints, 2])
             else:
-                y = tf.cast(y_int, tf.float32)
-                y = tf.reshape(y, [T, 1])
-                y = tf.ensure_shape(y, [T, 1])  # <- fija shape estática
+                y = tf.cast(labels_T, tf.float32)           # (T,)
+                y = tf.expand_dims(y, axis=-1)              # (T,1)
+                y = tf.ensure_shape(y, [n_timepoints, 1])
+            return eeg, y
 
+        # ---- Modo ventana ----
+        # y_hard: etiqueta dura por ventana
+        y_hard_int = tf.reduce_max(labels_T)                # 0/1 int32
+        # y_soft: fracción de positivos
+        y_soft_f = tf.reduce_mean(tf.cast(labels_T, tf.float32))
+
+        # Selección del modo de ventana
+        if window_mode == "soft":
+            # Etiqueta suave
+            if one_hot:
+                y = tf.stack([1.0 - y_soft_f, y_soft_f], axis=0)  # (2,)
+                y = tf.ensure_shape(y, [2])
+            else:
+                y = tf.reshape(y_soft_f, [1])                     # (1,)
+                y = tf.ensure_shape(y, [1])
         else:
-            # Ventana: una etiqueta por ejemplo
-            y_int = tf.cond(
-                L > 0,
-                lambda: tf.reduce_max(tf.cast(labels_flat, tf.int32)),
-                lambda: tf.constant(0, tf.int32),
-            )
+            # default y features → etiqueta dura
             if one_hot:
-                y = tf.one_hot(y_int, depth=2)
+                y = tf.one_hot(y_hard_int, depth=2)               # (2,)
                 y = tf.cast(y, tf.float32)
-                y = tf.ensure_shape(y, [2])  # <- fija shape estática
+                y = tf.ensure_shape(y, [2])
             else:
-                y = tf.cast(y_int, tf.float32)
-                y = tf.reshape(y, [1])
-                y = tf.ensure_shape(y, [1])  # <- fija shape estática
+                y = tf.cast(y_hard_int, tf.float32)
+                y = tf.reshape(y, [1])                            # (1,)
+                y = tf.ensure_shape(y, [1])
 
-        return x, y
+        # Agregar features como canales (solo en 'features')
+        if window_mode == "features":
+            feats = _window_features(eeg, labels_T)               # (F,)
+            feats_tiled = tf.tile(tf.reshape(feats, [1, WINDOW_FEATURES_DIM]), [n_timepoints, 1])  # (T,F)
+            eeg = tf.concat([eeg, feats_tiled], axis=-1)          # (T, C+F)
+            eeg = tf.ensure_shape(eeg, [n_timepoints, n_channels + WINDOW_FEATURES_DIM])
+
+        return eeg, y
 
     ds = tf.data.TFRecordDataset(tfrecord_files, num_parallel_reads=tf.data.AUTOTUNE)
 
@@ -452,15 +488,14 @@ def create_dataset_final(
     if cache:
         ds = ds.cache()
 
-    # ⚠️ Mantengo tu API: si usas balanceo especial, insértalo aquí.
     if balance_pos_frac is not None:
-        # Placeholder NO-OP. Si tienes una implementación propia de sample(),
-        # colócala aquí con cuidado de no romper las shapes.
+        # (placeholder) tu lógica de remuestreo si la implementas
         pass
 
-    ds = ds.batch(batch_size, drop_remainder=drop_remainder)  # <- asegura batch fijo
+    ds = ds.batch(batch_size, drop_remainder=drop_remainder)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
+
 
 # =================================================================================================================
 # 🎯 PIPELINE DEFINITIVO CON FUNCIÓN CORREGIDA
