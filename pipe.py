@@ -41,7 +41,7 @@ LEARNING_RATE = 2e-4
 MIN_LR_FRACTION = 0.05
 MIN_LR = LEARNING_RATE * MIN_LR_FRACTION
 WARMUP_RATIO = 0.1
-LIMITS={'train': 250, 'dev': 75, 'eval': 75}
+LIMITS={'train': 750, 'dev': 150, 'eval': 150}
 TIME_LIMIT_H = 24
 FRAME_HOP_SEC = 2.5
 SWEEP=False
@@ -62,9 +62,9 @@ RUNS_DIR = Path("./runs")
 RUN_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 RUN_DIR = RUNS_DIR / f"eeg_seizures_{RUN_STAMP}"
 
-MODEL = 'TCN'  
+MODEL = 'HYB'  
 # Use focal losses if True; otherwise standard cross-entropy losses
-FOCAL = False
+FOCAL = True
 # Dataset window mode configuration:
 # - "default": hard window label
 # - "soft": soft label = frac of positive frames
@@ -780,8 +780,8 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
     return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP)
      )
 
-    inspect_dataset(_count_ds)
-    inspect_dataset(val_ds)
+    inspect_dataset(_count_ds, num_batches=10000)
+    inspect_dataset(val_ds, num_batches=10000)
 
     # Compute effective input channels and whether we have a separate features vector
     eff_channels = n_channels
@@ -799,7 +799,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                        if FOCAL else
                        CategoricalCrossentropy(from_logits=False))
         else:
-            loss_fn = (BinaryFocalCrossentropy(alpha=0.75, gamma=1.5)
+            loss_fn = (BinaryFocalCrossentropy(alpha=0.75, gamma=3)
                        if FOCAL else
                        BinaryCrossentropy(from_logits=False))
         optimizer = tf.keras.optimizers.AdamW(
@@ -819,6 +819,8 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                         one_hot=ONEHOT,
                         time_step=TIME_STEP,
                         feat_input_dim=feat_input_dim,
+                        kernel_size=TCN_KERNEL_SIZE,
+                        num_filters=64,
                     )
                 case 'TRANS':
                     model = build_transformer(

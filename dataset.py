@@ -231,7 +231,8 @@ def serialize_example(eeg_flat, labels_flat, *,
                       n_timepoints: Optional[int] = None,
                       sfreq: Optional[float] = None,
                       start_tp: Optional[int] = None,
-                      hop_tp: Optional[int] = None):
+                      hop_tp: Optional[int] = None,
+                      writer_version: Optional[str] = None):
     """
     Optimized serialization with pre-encoded strings and efficient feature creation.
     """
@@ -260,6 +261,10 @@ def serialize_example(eeg_flat, labels_flat, *,
     for value, key, feature_fn in optional_features:
         if value is not None:
             features[key] = feature_fn(value)
+
+    # Add writer version provenance if provided
+    if writer_version is not None:
+        features["writer_version"] = _bytes_feature(writer_version.encode("utf-8"))
 
     example = tf.train.Example(features=tf.train.Features(feature=features))
     return example.SerializeToString()
@@ -359,7 +364,7 @@ def create_dataset_final(
     tfrecord_files, n_channels, n_timepoints, batch_size,
     one_hot=False, time_step=False, balance_pos_frac=None,
     cache=False, drop_remainder=False, shuffle=False, shuffle_buffer=4096,
-    window_mode="default"  # "default" | "soft" | "features" (solo aplica si time_step=False)
+    window_mode="default"  # "default" | "soft" | "features" | "soft+features" (solo aplica si time_step=False)
 ):
     """
     Dataset final con formas estables para Keras/XLA:
@@ -466,7 +471,7 @@ def create_dataset_final(
         y_soft_f = tf.reduce_mean(tf.cast(labels_T, tf.float32))
 
         # Selección del modo de ventana
-        if window_mode == "soft":
+        if window_mode in ("soft", "soft_features", "soft+features"):
             # Etiqueta suave
             if one_hot:
                 y = tf.stack([1.0 - y_soft_f, y_soft_f], axis=0)  # (2,)
@@ -485,8 +490,8 @@ def create_dataset_final(
                 y = tf.reshape(y, [1])                            # (1,)
                 y = tf.ensure_shape(y, [1])
 
-        # Agregar features como canales (solo en 'features')
-        if window_mode == "features":
+        # Agregar features como canales (en 'features' y 'soft+features')
+        if window_mode in ("features", "soft_features", "soft+features"):
             feats = _window_features(eeg, labels_T)               # (F,)
             feats_tiled = tf.tile(tf.reshape(feats, [1, WINDOW_FEATURES_DIM]), [n_timepoints, 1])  # (T,F)
             eeg = tf.concat([eeg, feats_tiled], axis=-1)          # (T, C+F)
@@ -516,11 +521,12 @@ def create_dataset_final_v2(
     tfrecord_files, n_channels, n_timepoints, batch_size,
     one_hot=False, time_step=False, balance_pos_frac=None,
     cache=False, drop_remainder=False, shuffle=False, shuffle_buffer=4096,
-    window_mode="default",  # "default" | "soft" | "features"
+    window_mode="default",  # "default" | "soft" | "features" | "soft+features"
     include_label_feats=False,  # si True, añade y_soft y y_hard como features extra (solo inspección)
     sample_rate=None,           # Hz. Requerido para band-powers
     feature_names=None,         # lista de strings desde ALL_EEG_FEATURES; si None usa DEFAULT_EEG_FEATURES
-    return_feature_vector=False # NUEVO: si True en modo 'features' devuelve (eeg, feats) sin replicar
+    return_feature_vector=False, # NUEVO: si True en modo 'features' devuelve (eeg, feats) sin replicar
+    prefetch: bool = True        # NUEVO: permite desactivar el prefetch interno para colocar repeat antes del prefetch final
 ):
     """
     Devuelve dataset (X, y). En modo ventana+features, X = (T, C + F_select) con features SOLO-EEG.
@@ -715,7 +721,9 @@ def create_dataset_final_v2(
             lambda: eeg_flat[:expected],
             lambda: tf.pad(eeg_flat, [[0, expected - size]])
         )
-        eeg = tf.reshape(eeg_flat, [n_timepoints, n_channels])
+        # Reconstruir (C,T) y transponer → (T,C) para alinear con escritura
+        eeg_ct = tf.reshape(eeg_flat, [n_channels, n_timepoints])
+        eeg = tf.transpose(eeg_ct, [1, 0])
         eeg = tf.cast(eeg, tf.float32)
         eeg = tf.ensure_shape(eeg, [n_timepoints, n_channels])
 
@@ -739,7 +747,7 @@ def create_dataset_final_v2(
         y_soft_f   = tf.reduce_mean(tf.cast(labels_T, tf.float32))  # [0,1]
 
         # Salida y
-        if window_mode == "soft":
+        if window_mode in ("soft", "soft_features", "soft+features"):
             if one_hot:
                 y = tf.stack([1.0 - y_soft_f, y_soft_f], axis=0)
                 y = tf.ensure_shape(y, [2])
@@ -756,8 +764,8 @@ def create_dataset_final_v2(
                 y = tf.reshape(y, [1])
                 y = tf.ensure_shape(y, [1])
 
-        # Agregar features como canales (modo 'features')
-        if window_mode == "features":
+        # Agregar features como canales o como vector separado en modos con features
+        if window_mode in ("features", "soft_features", "soft+features"):
             feats = _compute_features_eeg(eeg, tf.cast(sample_rate, tf.float32), selected_features)  # (F_sel,)
             if include_label_feats:
                 label_feats = tf.stack([y_soft_f, tf.cast(y_hard_int, tf.float32)], axis=0)  # (2,)
@@ -783,14 +791,20 @@ def create_dataset_final_v2(
     if balance_pos_frac is not None:
         pass
     ds = ds.batch(batch_size, drop_remainder=drop_remainder)
-    ds = ds.prefetch(tf.data.AUTOTUNE)
+    # Prefetch sólo si se solicita; para entrenamiento se recomienda: build -> batch -> repeat -> prefetch (externo)
+    if prefetch:
+        ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
 # =================================================================================================================
 # 🎯 PIPELINE DEFINITIVO CON FUNCIÓN CORREGIDA
 # =================================================================================================================
 
-def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_size_mb, dataset_type, resample_fs=256, window_sec=10.0, hop_sec=5.0):
+WRITER_VERSION = "v2-floorceil-mask"
+
+def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_size_mb, dataset_type,
+                                        resample_fs=256, window_sec=10.0, hop_sec=5.0,
+                                        strict_validate: bool = True):
     """
     ✅ VERSIÓN DEFINITIVAMENTE CORREGIDA
     ✅ NO MÁS ERRORES DE serialize_example
@@ -971,6 +985,24 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                         labels_df['probability_label'] = labels_df[numeric_cols[0]]
                     else:
                         labels_df['probability_label'] = 0.0
+
+            # Filtrar SOLO eventos de convulsión (evita marcar bckg como positivo)
+            mask_seiz = None
+            if 'seizure_label' in labels_df.columns:
+                seiz_str = labels_df['seizure_label'].astype(str).str.lower()
+                mask_text = seiz_str.str.contains('seiz')
+                mask_num = pd.to_numeric(labels_df['seizure_label'], errors='coerce')
+                mask_num = mask_num.fillna(0) > 0
+                mask_seiz = (mask_text | mask_num)
+            elif 'probability_label' in labels_df.columns:
+                mask_prob = pd.to_numeric(labels_df['probability_label'], errors='coerce').fillna(0)
+                # Umbral conservador > 0 para considerar como evento
+                mask_seiz = mask_prob > 0
+            else:
+                # Sin columnas útiles → asumir sin convulsiones
+                mask_seiz = pd.Series(False, index=labels_df.index)
+
+            labels_df = labels_df[mask_seiz]
             
         except Exception as e:
             return {
@@ -1006,38 +1038,56 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                         'tfrecord_files': []
                     }
             
-            # Convertir etiquetas a índices de muestra para mayor precisión
+            # Convertir etiquetas a índices (modo floor/ceil para minimizar pérdidas de cobertura)
+            # Nuevo helper local para robustez temporal; versión pública al final del archivo.
+            def _time_to_samples_interval(start_sec: float, stop_sec: float, fs: float, n_total: int,
+                                          mode: str = 'floor_ceil'):
+                """Convert (start, stop) seconds to sample indices [s_idx, e_idx) with selectable boundary mode.
+                mode:
+                  - 'round': legacy int(round(t*fs)) on both ends.
+                  - 'floor_ceil': floor on start, ceil on end (covers full annotated interval).
+                Returns (s_idx, e_idx) clipped to [0, n_total]."""
+                if mode == 'round':
+                    s_i = int(round(start_sec * fs))
+                    e_i = int(round(stop_sec * fs))
+                else:  # floor_ceil default
+                    import math
+                    s_i = int(math.floor(start_sec * fs))
+                    e_i = int(math.ceil(stop_sec * fs))
+                if e_i < s_i:
+                    return None
+                return max(0, s_i), min(n_total, e_i)
+
             seizure_intervals_samples = []
             for _, row in labels_df.iterrows():
                 if 'start_time' in row and 'stop_time' in row:
                     try:
-                        s_time = float(row['start_time'])
-                        e_time = float(row['stop_time'])
-                        s_idx = max(0, int(round(s_time * sfreq)))
-                        e_idx = min(n_samples, int(round(e_time * sfreq)))
-                        if e_idx > s_idx:
-                            seizure_intervals_samples.append((s_idx, e_idx))
-                    except (ValueError, TypeError):
+                        s_time = float(row['start_time']); e_time = float(row['stop_time'])
+                        res = _time_to_samples_interval(s_time, e_time, sfreq, n_samples, mode='floor_ceil')
+                        if res is not None:
+                            s_idx, e_idx = res
+                            if e_idx > s_idx:
+                                seizure_intervals_samples.append((s_idx, e_idx))
+                    except Exception:
                         continue
+
+            # Construir una máscara global de frames de convulsión sobre todo el registro (evita inconsistencias por ventana)
+            global_mask = np.zeros(n_samples, dtype=np.int8)
+            for s_idx, e_idx in seizure_intervals_samples:
+                global_mask[s_idx:e_idx] = 1
             
             windows_data = []
             windows_labels = []
-            
-            # Generación mejorada como en pipeline.py
+            positive_window_count = 0
             for start_sample in range(0, n_samples - window_samples + 1, step_samples):
                 end_sample = start_sample + window_samples
-                
                 window_signal = signal_data[:, start_sample:end_sample]
-                
-                # Etiquetas frame-level más precisas
-                labels_frame = np.zeros(window_samples, dtype=np.int64)
-                for s_idx, e_idx in seizure_intervals_samples:
-                    # Coordenadas locales de la ventana
-                    rs = max(0, s_idx - start_sample)
-                    re = min(window_samples, e_idx - start_sample)
-                    if re > rs:
-                        labels_frame[rs:re] = 1
-                
+                labels_frame = global_mask[start_sample:end_sample].astype(np.int64)
+                if labels_frame.shape[0] != window_samples:
+                    # Skip malformed window
+                    continue
+                if labels_frame.sum() > 0:
+                    positive_window_count += 1
                 windows_data.append(window_signal)
                 windows_labels.append(labels_frame)
             
@@ -1084,16 +1134,17 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                         
                         # Llamada con la signature EXACTA de tu función
                         example_bytes = serialize_example(
-                            eeg_flat,                                    # Primer parámetro posicional
-                            labels_flat,                                 # Segundo parámetro posicional
-                            patient_id=base_name.split('_')[0],         # Keyword argument requerido
-                            record_id=base_name,                        # Keyword argument requerido
-                            duration_sec=float(window_sec),             # Keyword argument requerido
-                            n_channels=int(window_signal.shape[0]),     # Opcional
-                            n_timepoints=int(window_signal.shape[1]),   # Opcional
-                            sfreq=float(sfreq),                         # Opcional
-                            start_tp=int(i * step_samples),             # Opcional
-                            hop_tp=int(step_samples)                    # Opcional
+                            eeg_flat,
+                            labels_flat,
+                            patient_id=base_name.split('_')[0],
+                            record_id=base_name,
+                            duration_sec=float(window_sec),
+                            n_channels=int(window_signal.shape[0]),
+                            n_timepoints=int(window_signal.shape[1]),
+                            sfreq=float(sfreq),
+                            start_tp=int(i * step_samples),
+                            hop_tp=int(step_samples),
+                            writer_version=WRITER_VERSION
                         )
                         
                         # ✅ serialize_example YA RETORNA BYTES - no necesita .SerializeToString()
@@ -1102,39 +1153,28 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                         
                     except Exception as serialize_error:
                         serialize_errors += 1
-                        print(f"   ⚠️  Error serialización ventana {i}: {serialize_error}")
-                        
-                        # Fallback manual SOLO si falla serialize_example
+                        print(f"   ⚠️  Error serialize_example ventana {i}: {serialize_error} → usando fallback completo frame-level")
+                        # Fallback único: siempre escribe etiquetas frame-level completas con metadatos
                         try:
-                            eeg_flat_fallback = window_signal.astype(np.float32).flatten()
-                            # Para fallback, usar etiqueta de ventana simplificada
-                            window_label_simple = int(np.any(window_labels_array > 0.5))
-                            labels_flat_fallback = np.array([window_label_simple], dtype=np.int64)
-                            
+                            eeg_flat_fb = window_signal.astype(np.float32).flatten()
+                            labels_flat_fb = window_labels_array.astype(np.int64).flatten()
                             feature = {
-                                'eeg': tf.train.Feature(
-                                    float_list=tf.train.FloatList(value=eeg_flat_fallback.tolist())
-                                ),
-                                'labels': tf.train.Feature(
-                                    int64_list=tf.train.Int64List(value=labels_flat_fallback.tolist())
-                                ),
-                                'patient_id': tf.train.Feature(
-                                    bytes_list=tf.train.BytesList(value=[base_name.split('_')[0].encode('utf-8')])
-                                ),
-                                'record_id': tf.train.Feature(
-                                    bytes_list=tf.train.BytesList(value=[base_name.encode('utf-8')])
-                                ),
-                                'duration_sec': tf.train.Feature(
-                                    float_list=tf.train.FloatList(value=[float(window_sec)])
-                                )
+                                'eeg': tf.train.Feature(float_list=tf.train.FloatList(value=eeg_flat_fb.tolist())),
+                                'labels': tf.train.Feature(int64_list=tf.train.Int64List(value=labels_flat_fb.tolist())),
+                                'patient_id': tf.train.Feature(bytes_list=tf.train.BytesList(value=[base_name.split('_')[0].encode('utf-8')])),
+                                'record_id': tf.train.Feature(bytes_list=tf.train.BytesList(value=[base_name.encode('utf-8')])),
+                                'duration_sec': tf.train.Feature(float_list=tf.train.FloatList(value=[float(window_sec)])),
+                                'n_timepoints': tf.train.Feature(int64_list=tf.train.Int64List(value=[int(window_signal.shape[1])])),
+                                'sfreq': tf.train.Feature(float_list=tf.train.FloatList(value=[float(sfreq)])),
+                                'start_tp': tf.train.Feature(int64_list=tf.train.Int64List(value=[int(i * step_samples)])),
+                                'hop_tp': tf.train.Feature(int64_list=tf.train.Int64List(value=[int(step_samples)])),
+                                'writer_version': tf.train.Feature(bytes_list=tf.train.BytesList(value=[WRITER_VERSION.encode('utf-8')])),
                             }
-                            
                             example = tf.train.Example(features=tf.train.Features(feature=feature))
                             writer.write(example.SerializeToString())
                             windows_written += 1
-                            
-                        except Exception as manual_error:
-                            print(f"   ❌ Error serialización manual ventana {i}: {manual_error}")
+                        except Exception as fb_error:
+                            print(f"   ❌ Error fallback frame-level ventana {i}: {fb_error}")
                             continue
             
             if not tfrecord_path.exists() or tfrecord_path.stat().st_size == 0:
@@ -1146,7 +1186,36 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                     'tfrecord_files': []
                 }
             
-            del signal_data, windows_data, windows_labels, labels_df
+            # Validaciones de integridad (eliminar archivo si falla en modo estricto)
+            if strict_validate:
+                has_events = len(seizure_intervals_samples) > 0
+                if not has_events and positive_window_count > 0:
+                    # Falso positivo en registro sin eventos → eliminar archivo
+                    try:
+                        tfrecord_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return {
+                        'success': False,
+                        'error': 'False positives in no-event record (aborted).',
+                        'csv_path': str(csv_path),
+                        'windows_created': 0,
+                        'tfrecord_files': []
+                    }
+                if has_events and positive_window_count == 0:
+                    try:
+                        tfrecord_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+                    return {
+                        'success': False,
+                        'error': 'No positive windows in event record (aborted).',
+                        'csv_path': str(csv_path),
+                        'windows_created': 0,
+                        'tfrecord_files': []
+                    }
+
+            del signal_data, windows_data, windows_labels, labels_df, global_mask
             gc.collect()
             
             return {
@@ -1187,7 +1256,8 @@ def write_tfrecord_splits_FINAL_CORRECTED(
     n_workers=None,
     chunk_size_mb=100,
     resume=True,
-    validate=True
+    validate=True,
+    strict_validate: bool | None = None,
 ):
     """
     🎯 PIPELINE DEFINITIVO SIN ERRORES DE SERIALIZE_EXAMPLE
@@ -1216,6 +1286,10 @@ def write_tfrecord_splits_FINAL_CORRECTED(
         n_workers = 1
     
     print(f"   Workers: {n_workers}")
+    # Determine strict validation mode (default: follow 'validate' flag if not explicitly set)
+    if strict_validate is None:
+        strict_validate = validate
+    print(f"   Strict validation: {strict_validate}")
     
     tfrecord_path = Path(tfrecord_dir)
     tfrecord_path.mkdir(exist_ok=True, parents=True)
@@ -1281,7 +1355,7 @@ def write_tfrecord_splits_FINAL_CORRECTED(
             }
             
             process_args = [
-                (str(f), str(split_output_dir), chunk_size_mb, tfrecord_split, resample_fs, window_sec, hop_sec) 
+                (str(f), str(split_output_dir), chunk_size_mb, tfrecord_split, resample_fs, window_sec, hop_sec, strict_validate)
                 for f in csv_files
             ]
             
@@ -1433,3 +1507,130 @@ def make_balanced_stream(ds, one_hot: bool, time_step: bool, target_pos_frac: fl
         weights=[target_pos_frac, 1.0 - target_pos_frac],
         seed=42
     )
+
+# =================================================================================================================
+# 🔍 VALIDATION HELPERS (EDF/CSV/TFRecord Consistency)
+# =================================================================================================================
+def parse_tfrecord_with_metadata(serialized_example, n_channels, n_timepoints):
+    """Parse a single serialized example returning dict with eeg(T,C), labels(T,), start_tp, hop_tp, sfreq, record_id.
+    Falls back gracefully if optional metadata fields missing."""
+    feature_desc = {
+        'eeg': tf.io.VarLenFeature(tf.float32),
+        'labels': tf.io.VarLenFeature(tf.int64),
+        'patient_id': tf.io.FixedLenFeature([], tf.string, default_value=b''),
+        'record_id': tf.io.FixedLenFeature([], tf.string, default_value=b''),
+        'duration_sec': tf.io.FixedLenFeature([], tf.float32, default_value=0.0),
+        'start_tp': tf.io.FixedLenFeature([], tf.int64, default_value=0),
+        'hop_tp': tf.io.FixedLenFeature([], tf.int64, default_value=0),
+        'n_timepoints': tf.io.FixedLenFeature([], tf.int64, default_value=n_timepoints),
+        'sfreq': tf.io.FixedLenFeature([], tf.float32, default_value=0.0),
+    }
+    p = tf.io.parse_single_example(serialized_example, feature_desc)
+    eeg_flat = tf.sparse.to_dense(p['eeg'])
+    lbl_flat = tf.sparse.to_dense(p['labels'])
+    # Reshape EEG (channels-first flattened) back to (C,T)->(T,C)
+    expected = n_channels * n_timepoints
+    size = tf.shape(eeg_flat)[0]
+    eeg_flat = tf.cond(size >= expected, lambda: eeg_flat[:expected], lambda: tf.pad(eeg_flat, [[0, expected - size]]))
+    eeg_ct = tf.reshape(eeg_flat, [n_channels, n_timepoints])
+    eeg_tc = tf.transpose(eeg_ct, [1, 0])
+    # Labels: may be frame-level length T or scalar if fallback legacy window; normalize to length T
+    L = tf.shape(lbl_flat)[0]
+    def _expand_scalar():
+        val = lbl_flat[0]
+        return tf.fill([n_timepoints], val)
+    def _truncate_or_pad():
+        y = lbl_flat[:n_timepoints]
+        need = n_timepoints - tf.shape(y)[0]
+        return tf.cond(need > 0, lambda: tf.pad(y, [[0, need]]), lambda: y)
+    labels_T = tf.cond(L == 1, _expand_scalar, _truncate_or_pad)
+    return {
+        'eeg': eeg_tc,            # (T,C)
+        'labels': tf.cast(labels_T, tf.int32),
+        'orig_label_len': L,
+        'start_tp': p['start_tp'],
+        'hop_tp': p['hop_tp'],
+        'sfreq': p['sfreq'],
+        'record_id': p['record_id'],
+        'duration_sec': p['duration_sec'],
+    }
+
+def iterate_tfrecord_windows(tfrecord_path, n_channels, n_timepoints, limit=None):
+    """Yield window dicts with metadata for a TFRecord file.
+    If start_tp metadata is missing (legacy), infer using hop_tp and window index."""
+    ds = tf.data.TFRecordDataset([tfrecord_path])
+    count = 0
+    for idx, raw in enumerate(ds):
+        out = parse_tfrecord_with_metadata(raw, n_channels, n_timepoints)
+        # Infer start if absent / zero for idx>0 and hop_tp>0
+        if int(out['start_tp'].numpy() if isinstance(out['start_tp'], tf.Tensor) else out['start_tp']) == 0 and idx > 0:
+            hop = int(out['hop_tp'].numpy() if isinstance(out['hop_tp'], tf.Tensor) else out['hop_tp'])
+            if hop > 0:
+                out['start_tp'] = tf.constant(idx * hop, dtype=tf.int64)
+        yield {k: (v.numpy() if isinstance(v, tf.Tensor) else v) for k,v in out.items()}
+        count += 1
+        if limit and count >= limit:
+            break
+
+def build_window_dataframe(windows, csv_intervals_sec, sfreq, tolerance_frames=0, boundary_mode: str = 'floor_ceil'):
+    """Given list of window dicts and CSV seizure intervals (list of (start_sec, stop_sec)), compute overlap metrics.
+    boundary_mode: 'floor_ceil' (default, writer current) or 'round' (legacy). Determines how seconds map to sample indices.
+    tolerance_frames: allowed per-window frame diff before counting mismatch."""
+    import pandas as pd
+    import math
+    csv_samples = []
+    for s,e in csv_intervals_sec:
+        if boundary_mode == 'round':
+            s_i = int(round(s*sfreq)); e_i = int(round(e*sfreq))
+        else:  # floor_ceil
+            s_i = int(math.floor(s*sfreq)); e_i = int(math.ceil(e*sfreq))
+        if e_i > s_i:
+            csv_samples.append((s_i, e_i))
+    rows = []
+    mismatched = 0
+    total = 0
+    for idx,w in enumerate(windows):
+        start_tp = int(w['start_tp'])
+        T = w['eeg'].shape[0]
+        labels = w['labels']
+        win_range = (start_tp, start_tp + T)
+        mask = np.zeros(T, dtype=np.int32)
+        for s,e in csv_samples:
+            os = max(s, win_range[0])
+            oe = min(e, win_range[1])
+            if oe > os:
+                ls = os - win_range[0]
+                le = oe - win_range[0]
+                mask[ls:le] = 1
+        diff = int((mask != labels).sum())
+        if diff > tolerance_frames:
+            mismatched += 1
+        total += 1
+        rows.append({
+            'window_idx': idx,
+            'start_tp': win_range[0],
+            'end_tp': win_range[1],
+            'y_hard': int(labels.max()),
+            'y_soft': float(labels.mean()),
+            'expected_soft': float(mask.mean()),
+            'label_diff_frames': diff,
+            'expected_positive_frames': int(mask.sum()),
+            'stored_positive_frames': int(labels.sum()),
+        })
+    df = pd.DataFrame(rows)
+    summary = {
+        'windows_total': total,
+        'windows_with_any_diff': mismatched,
+        'frames_total': int(sum(len(w['labels']) for w in windows)),
+        'frames_mismatch': int(df['label_diff_frames'].sum()),
+        'tolerance_frames': tolerance_frames,
+        'boundary_mode': boundary_mode
+    }
+    return df, summary
+
+__all__ = [
+    # existing public API (partial)
+    'create_dataset_final_v2', 'write_tfrecord_splits_FINAL_CORRECTED', 'WRITER_VERSION',
+    # validation helpers
+    'iterate_tfrecord_windows', 'build_window_dataframe'
+]
