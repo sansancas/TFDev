@@ -24,6 +24,22 @@ BANDPASS = True
 NORMALIZE = True
 WINDOW_FEATURES_DIM = 6
 
+# Catálogo y defaults (puedes ajustar)
+ALL_EEG_FEATURES = [
+    # Temporales básicos
+    "rms_eeg", "mad_eeg", "line_length", "zcr", "tkeo_mean",
+    # Hjorth
+    "hjorth_activity", "hjorth_mobility", "hjorth_complexity",
+    # Espectrales (relativos por defecto)
+    "bp_rel_delta", "bp_rel_theta", "bp_rel_alpha", "bp_rel_beta", "bp_rel_gamma",
+    # Extras espectrales
+    "spectral_entropy", "sef95", "beta_alpha_ratio", "theta_alpha_ratio",
+    # También disponibles (no incluidas en default): absolutos
+    "bp_delta", "bp_theta", "bp_alpha", "bp_beta", "bp_gamma",
+]
+
+DEFAULT_EEG_FEATURES = list(ALL_EEG_FEATURES)
+
 # =================================================================================================================
 # Montage-based CSV listing & filtering
 # =================================================================================================================
@@ -496,6 +512,279 @@ def create_dataset_final(
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
+def create_dataset_final_v2(
+    tfrecord_files, n_channels, n_timepoints, batch_size,
+    one_hot=False, time_step=False, balance_pos_frac=None,
+    cache=False, drop_remainder=False, shuffle=False, shuffle_buffer=4096,
+    window_mode="default",  # "default" | "soft" | "features"
+    include_label_feats=False,  # si True, añade y_soft y y_hard como features extra (solo inspección)
+    sample_rate=None,           # Hz. Requerido para band-powers
+    feature_names=None,         # lista de strings desde ALL_EEG_FEATURES; si None usa DEFAULT_EEG_FEATURES
+    return_feature_vector=False # NUEVO: si True en modo 'features' devuelve (eeg, feats) sin replicar
+):
+    """
+    Devuelve dataset (X, y). En modo ventana+features, X = (T, C + F_select) con features SOLO-EEG.
+    No se añaden features derivadas de labels (evita leakage). y es la etiqueta de la ventana (dura o suave, con/ sin one-hot).
+    """
+    if sample_rate is None:
+        raise ValueError("create_dataset_final_v2 requiere sample_rate para computar features espectrales.")
+
+    # Actualizar nombres globales para inspección
+    selected_features = list(feature_names) if feature_names is not None else list(DEFAULT_EEG_FEATURES)
+    global FEATURE_NAMES_BASE, FEATURE_NAMES_WITH_LABELS
+    FEATURE_NAMES_BASE = selected_features
+    FEATURE_NAMES_WITH_LABELS = FEATURE_NAMES_BASE + ["y_soft", "y_hard"]
+
+    feature_desc = {
+        'eeg': tf.io.VarLenFeature(tf.float32),
+        'labels': tf.io.VarLenFeature(tf.int64),
+        'patient_id': tf.io.FixedLenFeature([], tf.string, default_value=''),
+        'record_id': tf.io.FixedLenFeature([], tf.string, default_value=''),
+        'duration_sec': tf.io.FixedLenFeature([], tf.float32, default_value=0.0),
+    }
+
+    def _labels_to_vector_T(labels_flat):
+        L = tf.shape(labels_flat)[0]
+        def _replicate_one():
+            return tf.fill([n_timepoints], tf.cast(labels_flat[0], tf.int32))
+        def _fit_to_T():
+            y = tf.cast(labels_flat, tf.int32)
+            y = y[:n_timepoints]
+            need = n_timepoints - tf.shape(y)[0]
+            return tf.cond(need > 0, lambda: tf.pad(y, [[0, need]]), lambda: y)
+        return tf.cond(L <= 1, _replicate_one, _fit_to_T)  # (T,)
+
+    # Helpers SOLO-EEG
+    def _line_length(sig):
+        diff = tf.abs(sig[1:] - sig[:-1])        # (T-1, C)
+        ll = tf.reduce_sum(diff, axis=0)         # (C,)
+        return tf.reduce_mean(ll)                # escalar
+
+    def _zcr(sig):
+        sgn = tf.sign(sig)
+        sgn = tf.where(tf.equal(sgn, 0.0), tf.ones_like(sgn), sgn)
+        changes = tf.not_equal(sgn[1:], sgn[:-1])  # (T-1, C)
+        return tf.reduce_mean(tf.reduce_mean(tf.cast(changes, tf.float32), axis=0))
+
+    def _tkeo(sig):
+        x_t = sig[1:-1]
+        tke = tf.square(x_t) - sig[:-2] * sig[2:]
+        return tf.reduce_mean(tf.reduce_mean(tke, axis=0))
+
+    def _hjorth(sig):
+        # sig: (T, C)
+        x = sig
+        T = tf.shape(x)[0]
+        def _zeros():
+            return (tf.constant(0.0, tf.float32), tf.constant(0.0, tf.float32), tf.constant(0.0, tf.float32))
+        def _compute():
+            mean = tf.reduce_mean(x, axis=0)            # (C,)
+            x0 = x - mean
+            var0 = tf.reduce_mean(tf.square(x0), axis=0)  # (C,) activity
+            dx = x0[1:] - x0[:-1]
+            var1 = tf.reduce_mean(tf.square(dx), axis=0)  # (C,)
+            mobility = tf.sqrt((var1 + 1e-12) / (var0 + 1e-12))  # (C,)
+            ddx = dx[1:] - dx[:-1]
+            var2 = tf.reduce_mean(tf.square(ddx), axis=0)
+            complexity = tf.sqrt((var2 + 1e-12) / (var1 + 1e-12)) / (mobility + 1e-12)
+            return (tf.reduce_mean(var0), tf.reduce_mean(mobility), tf.reduce_mean(complexity))
+        return tf.cond(T >= 3, _compute, _zeros)
+
+    def _spectrum_features(sig, fs):
+        """TF-native, graph-friendly spectrum features using index slicing (no boolean_mask).
+        sig: (T, C) float32. Returns dict with band powers (abs/rel), spectral entropy, SEF95.
+        """
+        T = tf.shape(sig)[0]
+        fs_f = tf.cast(fs, tf.float32)
+        eps = tf.constant(1e-8, tf.float32)
+
+        def _zero():
+            z = {
+                'bp_delta': 0.0, 'bp_theta': 0.0, 'bp_alpha': 0.0, 'bp_beta': 0.0, 'bp_gamma': 0.0,
+                'bp_rel_delta': 0.0, 'bp_rel_theta': 0.0, 'bp_rel_alpha': 0.0, 'bp_rel_beta': 0.0, 'bp_rel_gamma': 0.0,
+                'spectral_entropy': 0.0, 'sef95': 0.0,
+            }
+            return {k: tf.constant(v, tf.float32) for k, v in z.items()}
+
+        def _bin_bounds(f_lo, f_hi, N):
+            # rfft bins: k in [0..N//2], freq = k * fs / N
+            k_lo = tf.cast(tf.math.ceil((tf.cast(f_lo, tf.float32) * tf.cast(N, tf.float32)) / (fs_f + eps)), tf.int32)
+            k_hi = tf.cast(tf.math.floor((tf.cast(f_hi, tf.float32) * tf.cast(N, tf.float32)) / (fs_f + eps)), tf.int32)
+            k_lo = tf.clip_by_value(k_lo, 0, N // 2)
+            k_hi = tf.clip_by_value(k_hi, 0, N // 2)
+            k_hi = tf.maximum(k_hi, k_lo + 1)  # ensure non-empty
+            return k_lo, k_hi
+
+        def _compute():
+            win = tf.signal.hann_window(T)
+            xw = sig * tf.reshape(win, [T, 1])              # (T,C)
+            Xf = tf.signal.rfft(xw, fft_length=None)        # (F, C)
+            pxx = tf.math.real(Xf * tf.math.conj(Xf))       # (F, C)
+            F = tf.shape(pxx)[0]                            # F = N//2 + 1
+            N = (F - 1) * 2                                 # infer original FFT length
+
+            # Band indices
+            k_d0, k_d1 = _bin_bounds(0.5, 4.0, N)
+            k_t0, k_t1 = _bin_bounds(4.0, 8.0, N)
+            k_a0, k_a1 = _bin_bounds(8.0, 13.0, N)
+            k_b0, k_b1 = _bin_bounds(13.0, 30.0, N)
+            k_g0, k_g1 = _bin_bounds(30.0, tf.minimum(fs_f/2.0, 80.0), N)
+            k_tot0, k_tot1 = _bin_bounds(0.5, tf.minimum(fs_f/2.0, 45.0), N)
+
+            def _sum_band(k0, k1):
+                band = pxx[k0:k1, :]                        # (Kb, C)
+                return tf.reduce_mean(tf.reduce_sum(band, axis=0))  # scalar avg over channels
+
+            bp_delta = _sum_band(k_d0, k_d1)
+            bp_theta = _sum_band(k_t0, k_t1)
+            bp_alpha = _sum_band(k_a0, k_a1)
+            bp_beta  = _sum_band(k_b0, k_b1)
+            bp_gamma = _sum_band(k_g0, k_g1)
+            total    = _sum_band(k_tot0, k_tot1)
+
+            # Spectral entropy in 0.5..min(45, nyq)
+            p_band = pxx[k_tot0:k_tot1, :]                  # (Kb, C)
+            p_sum = tf.reduce_sum(p_band, axis=0, keepdims=True) + eps
+            p_norm = p_band / p_sum
+            ent = -tf.reduce_sum(p_norm * tf.math.log(p_norm + eps), axis=0)
+            Kb = tf.cast(tf.shape(p_band)[0], tf.float32)
+            ent_norm = ent / (tf.math.log(Kb + eps))
+            spectral_entropy = tf.reduce_mean(ent_norm)
+
+            # SEF95 per channel using cumulative sum and index search
+            csum = tf.math.cumsum(p_band, axis=0)           # (Kb, C)
+            frac = csum / p_sum                             # (Kb, C)
+            thr = tf.cast(frac >= 0.95, tf.int32)           # (Kb, C)
+            idx_in_band = tf.argmax(thr, axis=0)            # (C,)
+            k0_f = tf.cast(k_tot0, tf.float32)
+            idx_abs = tf.cast(idx_in_band, tf.float32) + k0_f  # (C,)
+            sef95_ch = (idx_abs * fs_f) / (tf.cast(N, tf.float32) + eps)
+            sef95 = tf.reduce_mean(sef95_ch)
+
+            return {
+                'bp_delta': bp_delta, 'bp_theta': bp_theta, 'bp_alpha': bp_alpha, 'bp_beta': bp_beta, 'bp_gamma': bp_gamma,
+                'bp_rel_delta': bp_delta / (total + eps),
+                'bp_rel_theta': bp_theta / (total + eps),
+                'bp_rel_alpha': bp_alpha / (total + eps),
+                'bp_rel_beta':  bp_beta  / (total + eps),
+                'bp_rel_gamma': bp_gamma / (total + eps),
+                'spectral_entropy': spectral_entropy,
+                'sef95': sef95,
+            }
+        return tf.cond(T >= 3, _compute, _zero)
+
+    def _compute_features_eeg(eeg_tc, fs, names):
+
+        x = tf.cast(eeg_tc, tf.float32)   # (T,C)
+        feats_dict = {}
+        # Temporales básicos
+        feats_dict['rms_eeg'] = tf.sqrt(tf.reduce_mean(tf.square(x)))
+        feats_dict['mad_eeg'] = tf.reduce_mean(tf.abs(x - tf.reduce_mean(x)))
+        feats_dict['line_length'] = tf.cond(tf.shape(x)[0] >= 2, lambda: _line_length(x), lambda: tf.constant(0.0, tf.float32))
+        feats_dict['zcr'] = tf.cond(tf.shape(x)[0] >= 2, lambda: _zcr(x), lambda: tf.constant(0.0, tf.float32))
+        feats_dict['tkeo_mean'] = tf.cond(tf.shape(x)[0] >= 3, lambda: _tkeo(x), lambda: tf.constant(0.0, tf.float32))
+        # Hjorth
+        hj_act, hj_mob, hj_com = _hjorth(x)
+        feats_dict['hjorth_activity'] = hj_act
+        feats_dict['hjorth_mobility'] = hj_mob
+        feats_dict['hjorth_complexity'] = hj_com
+        # Espectrales
+        spec = _spectrum_features(x, fs)
+        feats_dict.update(spec)
+        # Ratios
+        eps = tf.constant(1e-8, tf.float32)
+        feats_dict['beta_alpha_ratio'] = spec['bp_beta'] / (spec['bp_alpha'] + eps)
+        feats_dict['theta_alpha_ratio'] = spec['bp_theta'] / (spec['bp_alpha'] + eps)
+        # Ensamblar en el orden solicitado (garantiza orden estable)
+        vals = [feats_dict[name] for name in names]
+        feats_raw = tf.stack(vals, axis=0)
+        feats_raw = tf.ensure_shape(feats_raw, [len(names)])
+        # Sanitizar usando variable temporal para evitar leer 'feats' antes de asignación
+        feats = tf.where(tf.math.is_finite(feats_raw), feats_raw, tf.zeros_like(feats_raw))
+        return feats  # (F_sel,)
+
+    def _parse(example_proto):
+        parsed = tf.io.parse_single_example(example_proto, feature_desc)
+
+        # EEG -> (T, C)
+        eeg_flat = tf.sparse.to_dense(parsed['eeg'])
+        expected = n_channels * n_timepoints
+        size = tf.shape(eeg_flat)[0]
+        eeg_flat = tf.cond(
+            size >= expected,
+            lambda: eeg_flat[:expected],
+            lambda: tf.pad(eeg_flat, [[0, expected - size]])
+        )
+        eeg = tf.reshape(eeg_flat, [n_timepoints, n_channels])
+        eeg = tf.cast(eeg, tf.float32)
+        eeg = tf.ensure_shape(eeg, [n_timepoints, n_channels])
+
+        # Labels -> (T,)
+        labels_flat = tf.sparse.to_dense(parsed['labels'])
+        labels_T = _labels_to_vector_T(labels_flat)
+
+        if time_step:
+            if one_hot:
+                y = tf.one_hot(labels_T, depth=2)
+                y = tf.cast(y, tf.float32)
+                y = tf.ensure_shape(y, [n_timepoints, 2])
+            else:
+                y = tf.cast(labels_T, tf.float32)
+                y = tf.expand_dims(y, axis=-1)
+                y = tf.ensure_shape(y, [n_timepoints, 1])
+            return eeg, y
+
+        # Ventana: etiquetas dura y suave (para y)
+        y_hard_int = tf.reduce_max(labels_T)               # 0/1 int32
+        y_soft_f   = tf.reduce_mean(tf.cast(labels_T, tf.float32))  # [0,1]
+
+        # Salida y
+        if window_mode == "soft":
+            if one_hot:
+                y = tf.stack([1.0 - y_soft_f, y_soft_f], axis=0)
+                y = tf.ensure_shape(y, [2])
+            else:
+                y = tf.reshape(y_soft_f, [1])
+                y = tf.ensure_shape(y, [1])
+        else:
+            if one_hot:
+                y = tf.one_hot(y_hard_int, depth=2)
+                y = tf.cast(y, tf.float32)
+                y = tf.ensure_shape(y, [2])
+            else:
+                y = tf.cast(y_hard_int, tf.float32)
+                y = tf.reshape(y, [1])
+                y = tf.ensure_shape(y, [1])
+
+        # Agregar features como canales (modo 'features')
+        if window_mode == "features":
+            feats = _compute_features_eeg(eeg, tf.cast(sample_rate, tf.float32), selected_features)  # (F_sel,)
+            if include_label_feats:
+                label_feats = tf.stack([y_soft_f, tf.cast(y_hard_int, tf.float32)], axis=0)  # (2,)
+                feats = tf.concat([feats, label_feats], axis=0)
+            # Si se solicita vector separado NO replicamos ni concatenamos
+            if return_feature_vector:
+                return (eeg, feats), y
+            # Comportamiento anterior (compatibilidad): replicar y concatenar
+            F = tf.shape(feats)[0]
+            feats_tiled = tf.tile(tf.reshape(feats, [1, F]), [n_timepoints, 1])
+            eeg = tf.concat([eeg, feats_tiled], axis=-1)
+            eeg = tf.ensure_shape(eeg, [n_timepoints, n_channels + feats.shape[0] if feats.shape.rank==1 else None])
+            return eeg, y
+
+        return eeg, y
+
+    ds = tf.data.TFRecordDataset(tfrecord_files, num_parallel_reads=tf.data.AUTOTUNE)
+    if shuffle:
+        ds = ds.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
+    ds = ds.map(_parse, num_parallel_calls=tf.data.AUTOTUNE)
+    if cache:
+        ds = ds.cache()
+    if balance_pos_frac is not None:
+        pass
+    ds = ds.batch(batch_size, drop_remainder=drop_remainder)
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds
 
 # =================================================================================================================
 # 🎯 PIPELINE DEFINITIVO CON FUNCIÓN CORREGIDA
@@ -1119,3 +1408,28 @@ def write_tfrecord_splits_FINAL_CORRECTED(
         print(f"\\n⚠️  No se generaron TFRecords - revisar errores arriba")
     
     return total_stats
+
+def make_balanced_stream(ds, one_hot: bool, time_step: bool, target_pos_frac: float = 0.5):
+    """
+    Balanceo por muestreo SIN repetir por rama. El .repeat() debe aplicarse
+    UNA sola vez al flujo base antes de invocar esta función.
+    """
+    def is_positive(x, lbl):
+        # escalar booleano por elemento
+        if one_hot:
+            # soporta (T,C) o (C,)
+            y = lbl[..., 1] if (lbl.shape.rank is None or lbl.shape.rank == 0 or lbl.shape[-1] >= 2) else lbl
+            y = tf.cast(y, tf.float32)
+            return tf.reduce_any(y > 0.5) if time_step else (y >= 0.5)
+        else:
+            y = tf.cast(lbl, tf.float32)
+            return tf.reduce_any(y > 0.5) if time_step else (y >= 0.5)
+
+    ds_pos = ds.filter(is_positive)  # sin repeat aquí
+    ds_neg = ds.filter(lambda x, y: tf.logical_not(is_positive(x, y)))  # sin repeat aquí
+
+    return tf.data.Dataset.sample_from_datasets(
+        [ds_pos, ds_neg],
+        weights=[target_pos_frac, 1.0 - target_pos_frac],
+        seed=42
+    )

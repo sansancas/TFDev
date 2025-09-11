@@ -1,753 +1,1104 @@
-# shukeda_optimized.py
-# Pipeline EEG — estable, serializable y con métricas/ETA ligeros
-# - ONEHOT/BINARIO y TIME_STEP on/off
-# - Métricas nativas + custom (BA, Brier, Spec@t, Sens@Spec, Spec@Sens, TP/TN/FP/FN@t)
-# - LR Warmup + Cosine, ¡serializable!
-# - Checkpoints por múltiples monitores (solo pesos)
-# - Entrenamiento con repeat() + steps explícitos
-# - Verbose=2 con LightETA (estado/ETA cada N segundos)
-
-import os, re, gc, glob, time, math, logging
+import os
+import re
+import glob
+import time
+import math
 from pathlib import Path
 from datetime import datetime
+import logging
+from typing import Optional
+
 import numpy as np
 import tensorflow as tf
-from models.jit_model import JITModel
-from dataset import WINDOW_FEATURES_DIM
+from tensorflow.keras import mixed_precision
+from tensorflow.keras.losses import BinaryFocalCrossentropy, CategoricalFocalCrossentropy, BinaryCrossentropy, CategoricalCrossentropy# , Tversky, Loss, Reduction
+from tensorflow.keras import layers, models
+from tensorflow.keras import backend as K
+import absl.logging as absl
+from tqdm.keras import TqdmCallback
+from dataset import create_dataset_final_v2, write_tfrecord_splits_FINAL_CORRECTED, DEFAULT_EEG_FEATURES
 
-# ========================== CONFIG GLOBAL ====================================
-ONEHOT        = False          # True: salida one-hot (2 clases); False: binaria (1 salida)
-TIME_STEP     = False           # True: salida (B,T,C/1); False: (B,C/1)
-WINDOW_MODE   = "features"          # "default" | "soft" | "features" (solo aplica si TIME_STEP=False)
-WINDOW_SEC    = 5.0
-FRAME_HOP_SEC = 1.0
-FS_TARGET     = 256
-BATCH_SIZE    = 8
-EPOCHS        = 100
+tf.config.optimizer.set_jit(True)
+from tensorflow.keras.callbacks import Callback, CSVLogger, TerminateOnNaN, SwapEMAWeights, TensorBoard, BackupAndRestore
+from models.TCN import build_tcn
+from models.Hybrid import build_hybrid
+from models.Transformer import build_transformer
+# from tensorflow_addons.callbacks import TQDMProgressBar
+
+USE_GRU = True
+USE_SE = True
+PREPROCESS = {
+    'bandpass': (0.5, 40.),   # (low, high) Hz
+    'notch': 60.,             # Hz
+    'resample': 256,          # Hz target
+}
+WINDOW_SEC = 5.0             # Window length in seconds
+BATCH_SIZE = 48
+EPOCHS = 100
+USE_DROPOUT = True
+DROPOUT_RATE = 0.2
 LEARNING_RATE = 2e-4
-WARMUP_RATIO  = 0.1            # fracción de pasos para warmup
-MIN_LR_FRAC   = 0.05           # mínimo relativo en CosineDecay
-WEIGHT_DECAY  = 1e-3
-TIME_LIMIT_H  = 48
-# LIMITS        = {'train': 200, 'dev': 75, 'eval': 75}
-LIMITS        = {'train': 500, 'dev': 100, 'eval': 100}
-WRITE_TFREC   = True
-BALANCE_POS_FRAC = None        # si tu create_dataset_final lo soporta (p.ej. 0.5)
-
-# Métricas: umbrales fijos y objetivos de operación
-THRESHOLDS              = [0.30, 0.50, 0.70]         # crea recall@t, specificity@t, TP/TN/FP/FN@t, BA@t
-SENS_AT_SPEC_TARGETS    = [0.90, 0.95]    # sensibilidad a especificidad objetivo
-SPEC_AT_SENS_TARGETS    = [0.90]          # especificidad a sensibilidad objetivo
-
-# Monitores de checkpoints
-PRIMARY_MONITOR         = "val_auc_pr"
-SECONDARY_MONITORS      = []  # si vacío, se autollenan según listas de arriba
-
-# Dirs (ajusta a tu estructura)
+MIN_LR_FRACTION = 0.05
+MIN_LR = LEARNING_RATE * MIN_LR_FRACTION
+WARMUP_RATIO = 0.1
+LIMITS={'train': 250, 'dev': 75, 'eval': 75}
+TIME_LIMIT_H = 24
+FRAME_HOP_SEC = 2.5
+SWEEP=False
+HPC = False
+ONEHOT = False
+TIME_STEP = False
+TRANSPOSE = True
+NOTCH = True
+BANDPASS = True
+NORMALIZE = True
+NUM_CLASSES = 2  if ONEHOT else 1
+WRITE = True
+CUT = True
 FULL_REC = './records2' if ONEHOT else './bin_records2'
-CUT_REC  = './records_cut2' if ONEHOT else './bin_records_cut2'
-TFRECORD_DIR = CUT_REC
+CUT_REC = './records_cut2' if ONEHOT else './bin_records_cut2'
+TFRECORD_DIR = CUT_REC if CUT else FULL_REC
 RUNS_DIR = Path("./runs")
 RUN_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 RUN_DIR = RUNS_DIR / f"eeg_seizures_{RUN_STAMP}"
-LIGHT_TRAIN_METRICS = False
 
-# ======================= IMPORTA DATASET Y MODELO ============================
-from dataset import write_tfrecord_splits_FINAL_CORRECTED, create_dataset_final
-from models.TCN import build_tcn
+MODEL = 'TCN'  
+# Use focal losses if True; otherwise standard cross-entropy losses
+FOCAL = False
+# Dataset window mode configuration:
+# - "default": hard window label
+# - "soft": soft label = frac of positive frames
+# - "features": window-level EEG features concatenated as extra channels (only window-level)
+WINDOW_MODE = "features"
+# Feature names to use when WINDOW_MODE=="features" (subset of dataset.DEFAULT_EEG_FEATURES)
+# Lighter, standard set for seizure studies (time-domain + key spectral):
 
-# ====================== SILENCIAR / MIXED PRECISION ==========================
-os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
-try: tf.get_logger().setLevel(logging.ERROR)
-except Exception: pass
-
-# Mixed precision
-tf.keras.mixed_precision.set_global_policy('mixed_float16')
-
-# Determinismo “razonable”
-os.environ.setdefault("TF_DETERMINISTIC_OPS", "1")
-os.environ.setdefault("TF_CUDNN_DETERMINISTIC", "1")
-os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")  # evita pequeñas diferencias numéricas
-np.random.seed(42); tf.random.set_seed(42)
-
-# Desactivar barra interactiva (usamos verbose=2 + LightETA)
-tf.keras.utils.disable_interactive_logging()
-
-# ---------- Helper: normaliza a vectores binarios 1D ----------
-def _to_binary_vectors(y_true, y_pred):
-    yt = tf.cast(y_true, tf.float32)
-    yp = tf.cast(y_pred, tf.float32)
-
-    # y_pred -> prob de clase positiva
-    if yp.shape.rank is not None and yp.shape.rank >= 1:
-        last = yp.shape[-1]
-        if last == 2:
-            yp = yp[..., 1]
-        elif last == 1:
-            yp = tf.squeeze(yp, axis=-1)
-
-    # y_true -> etiqueta binaria 0/1
-    if yt.shape.rank is not None and yt.shape.rank >= 1:
-        last = yt.shape[-1]
-        if last == 2:
-            yt = yt[..., 1]
-        elif last == 1:
-            yt = tf.squeeze(yt, axis=-1)
-
-    yt = tf.reshape(yt, [-1])
-    yp = tf.reshape(yp, [-1])
-    return yt, yp
+# FEATURE_NAMES = list(DEFAULT_EEG_FEATURES)  # all
 
 
-# ================= MÉTRICAS PERSONALIZADAS / WRAPPERS ========================
+FEATURE_NAMES = [
+    "rms_eeg",
+    "line_length",
+    "hjorth_activity",
+    "hjorth_mobility",
+    "hjorth_complexity",
+    "bp_rel_theta",
+    "bp_rel_alpha",
+    "bp_rel_beta",
+    "spectral_entropy",
+    "sef95",
+]
+# If True and WINDOW_MODE=="features" and TIME_STEP==False, the dataset will return (eeg, feats) separately
+# and models will use a dual-input path for better efficiency.
+FEATURES_AS_VECTOR = True
+
+# TCN-specific hyperparameters (used when MODEL == 'TCN')
+TCN_KERNEL_SIZE = 7
+TCN_BLOCKS = 7
+
+# ---------------------- Run configuration snapshot ----------------------
+def save_run_config(run_dir: Path, extra: dict | None = None):
+    cfg = {
+        "MODEL": MODEL,
+        "FOCAL": FOCAL,
+        "PREPROCESS": PREPROCESS,
+        "WINDOW_SEC": WINDOW_SEC,
+        "FRAME_HOP_SEC": FRAME_HOP_SEC,
+        "BATCH_SIZE": BATCH_SIZE,
+        "EPOCHS": EPOCHS,
+        "LEARNING_RATE": LEARNING_RATE,
+        "MIN_LR_FRACTION": MIN_LR_FRACTION,
+        "WARMUP_RATIO": WARMUP_RATIO,
+        "TIME_LIMIT_H": TIME_LIMIT_H,
+        "LIMITS": LIMITS,
+        "HPC": HPC,
+        "ONEHOT": ONEHOT,
+        "TIME_STEP": TIME_STEP,
+        "USE_SE": USE_SE,
+        "USE_DROPOUT": USE_DROPOUT,
+        "DROPOUT_RATE": DROPOUT_RATE,
+        "WINDOW_MODE": WINDOW_MODE,
+        "FEATURE_NAMES": FEATURE_NAMES,
+        "FEATURES_AS_VECTOR": FEATURES_AS_VECTOR,
+    "TCN_KERNEL_SIZE": TCN_KERNEL_SIZE,
+    "TCN_BLOCKS": TCN_BLOCKS,
+        "CUT": CUT,
+        "TFRECORD_DIR": str(TFRECORD_DIR),
+        "RUN_DIR": str(run_dir),
+    }
+    if extra:
+        cfg.update(extra)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    import json
+    with open(run_dir / "run_config.json", "w") as f:
+        json.dump(cfg, f, indent=2)
+
+def save_model_summary(model, run_dir: Path):
+    buf = []
+    model.summary(print_fn=lambda s: buf.append(s))
+    (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+    with open(run_dir / "artifacts" / "model_summary.txt", "w") as f:
+        f.write("\n".join(buf))
+    
+    # ---------------------- Receptive Field utilities ----------------------
+def tcn_receptive_field(kernel_size: int, num_blocks: int, dilation_base: int = 2, convs_per_block: int = 2) -> int:
+    """Compute receptive field (in time steps) for a stack of dilated TCN blocks.
+    Each block contains `convs_per_block` conv layers (here 2), both with the same dilation d=base**i.
+    RF ≈ 1 + (k-1) * convs_per_block * Σ base**i, i=0..num_blocks-1.
+    """
+    return 1 + (kernel_size - 1) * convs_per_block * sum(dilation_base ** i for i in range(num_blocks))
+
+def print_receptive_field_tcn(t_steps: int, fs: int, kernel_size: int, num_blocks: int, run_dir: Path | None = None):
+    rf_steps = tcn_receptive_field(kernel_size, num_blocks)
+    rf_sec = rf_steps / float(fs)
+    win_sec = t_steps / float(fs)
+    msg = (
+        f"TCN receptive field: {rf_steps} steps (~{rf_sec:.3f}s) over window {t_steps} steps (~{win_sec:.3f}s).\n"
+        f"Blocks={num_blocks}, kernel_size={kernel_size}, fs={fs}Hz"
+    )
+    print(msg)
+    if run_dir is not None:
+        (run_dir / "artifacts").mkdir(parents=True, exist_ok=True)
+        with open(run_dir / "artifacts" / "receptive_field.txt", "w") as f:
+            f.write(msg + "\n")
+
+def infer_tcn_hparams_from_model(model) -> tuple[int, int]:
+    """Infer (kernel_size, num_blocks) from a TCN model by scanning Conv1D/SeparableConv1D blocks.
+    Falls back to (7, 7) if not detected.
+    """
+    ks = None
+    blocks = set()
+    for l in model.layers:
+        name = getattr(l, 'name', '')
+        if not hasattr(l, 'kernel_size'):
+            continue
+        if 'block' in name and (name.startswith('conv') or name.startswith('sepconv')):
+            # kernel_size is tuple like (k,)
+            try:
+                ks = int(l.kernel_size[0])
+            except Exception:
+                pass
+            m = re.search(r'block(\d+)', name)
+            if m:
+                try:
+                    blocks.add(int(m.group(1)))
+                except Exception:
+                    pass
+    num_blocks = max(blocks) if blocks else 7
+    if ks is None:
+        ks = 7
+    return ks, num_blocks
+
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")   # 1=INFO, 2=WARNING, 3=ERROR
+# si quieres, suprime mensajes de oneDNN también
+os.environ.setdefault("ONE_DNN_VERBOSE", "0")
+
+# habilita logging interactivo de Keras (progbar con \r), si existe en tu versión
+try:
+    if hasattr(tf.keras.utils, "enable_interactive_logging"):
+        tf.keras.utils.enable_interactive_logging()
+    # y baja la verbosidad de loggers Python/absl
+    tf.get_logger().setLevel(logging.ERROR)
+    try:
+        
+        absl.set_verbosity(absl.ERROR)
+    except Exception:
+        pass
+except Exception:
+    pass
+
+if HPC:
+    mixed_precision.set_global_policy('float32')
+    print("Using float32 policy for HPC")
+else:
+    mixed_precision.set_global_policy('mixed_float16')
+    print("Using mixed_float16")
+
+np.random.seed(42)
+tf.random.set_seed(42)
+
+class LRLogger(Callback):
+    def __init__(self, log_dir, every_steps=10):
+        super().__init__()
+        self.every = int(every_steps)
+        self.fw = tf.summary.create_file_writer(str(Path(log_dir) / "tb" / "lr"))
+
+    def _current_lr(self):
+        opt = self.model.optimizer
+        lr = opt.learning_rate
+        step_var = opt.iterations  # MirroredVariable
+        if callable(lr):  # schedule
+            lr_t = lr(step_var)  # pass the tensor-var directly
+        else:
+            lr_t = tf.convert_to_tensor(lr, dtype=tf.float32)
+        return float(K.get_value(lr_t))
+
+    def on_train_batch_end(self, batch, logs=None):
+        step_var = self.model.optimizer.iterations  # int64 tensor
+        step = int(K.get_value(step_var))           # Python int for modulo
+        if step % self.every == 0:
+            opt = self.model.optimizer
+            lr = opt.learning_rate
+            lr_t = lr(step_var) if callable(lr) else tf.convert_to_tensor(lr, tf.float32)
+            with self.fw.as_default():
+                tf.summary.scalar("learning_rate", lr_t, step=step_var)
+
+class TimeLimitCallback(tf.keras.callbacks.Callback):
+    def __init__(self, max_seconds):
+        super().__init__()
+        self.max_seconds = max_seconds
+
+    def on_train_begin(self, logs=None):
+        self.start_time = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        elapsed = time.time() - self.start_time
+        if elapsed > self.max_seconds:
+            print(f"\nTiempo límite alcanzado ({elapsed:.0f}s > {self.max_seconds}s), deteniendo entrenamiento.")
+            self.model.stop_training = True
+
+class TimeHistory(tf.keras.callbacks.Callback):
+    def on_train_begin(self, logs=None):
+        self.train_start = time.time()
+        self.epoch_times = []
+        print("Training start:", time.strftime("%X"))
+
+    def on_epoch_begin(self, epoch, logs=None):
+        self.epoch_start = time.time()
+
+    def on_epoch_end(self, epoch, logs=None):
+        epoch_time = time.time() - self.epoch_start
+        self.epoch_times.append(epoch_time)
+        total_time  = time.time() - self.train_start
+        print(f"→ Epoch {epoch+1} took {epoch_time:.1f}s, total elapsed {total_time:.1f}s")
+
+    def on_train_end(self, logs=None):
+        total_time = time.time() - self.train_start
+        print("Training finished at", time.strftime("%X"), f"(total {total_time:.1f}s)")
+
+class CSVLoggerWithEpochTime(tf.keras.callbacks.CSVLogger):
+    """CSVLogger that also writes epoch_time seconds per epoch if available via a TimeHistory callback.
+    It appends a 'epoch_time' column to the CSV.
+    """
+    def __init__(self, filename, time_cb: TimeHistory | None = None, **kwargs):
+        super().__init__(filename, **kwargs)
+        self._time_cb = time_cb
+        self._wrote_header = False
+    def on_epoch_end(self, epoch, logs=None):
+        logs = dict(logs or {})
+        if self._time_cb and len(self._time_cb.epoch_times) > epoch:
+            logs['epoch_time'] = float(self._time_cb.epoch_times[epoch])
+        else:
+            logs['epoch_time'] = None
+        return super().on_epoch_end(epoch, logs)
+
+# --- util: seleccionar la columna de una clase cuando y_true/y_pred son one-hot ---
+def _select_col(y_true, y_pred, class_index: int):
+    """Devuelve (y_true, y_pred) de la clase pedida.
+    - one-hot (..,2): selecciona la columna class_index
+    - binario (..,1): usa tal cual si class_index==1; invierte si class_index==0
+    Funciona tanto en modo ventana como time-step (se aplanará internamente en métricas Keras).
+    """
+    y_true = tf.cast(y_true, tf.float32)
+    y_pred = tf.cast(y_pred, tf.float32)
+    last_rank = y_pred.shape.rank
+    last_dim = (y_pred.shape[-1] if last_rank is not None else None)
+
+    if last_dim == 2:
+        y_true_c = y_true[..., class_index]
+        y_pred_c = y_pred[..., class_index]
+        return y_true_c, y_pred_c
+
+    # Binario o desconocido
+    if last_dim == 1:
+        y_true_b = tf.squeeze(y_true, axis=-1)
+        y_pred_b = tf.squeeze(y_pred, axis=-1)
+    else:
+        # ya vector
+        y_true_b = y_true
+        y_pred_b = y_pred
+
+    # If labels might be soft (window_mode=="soft"), downstream metrics expect binary ground truth.
+    # We'll threshold y_true at 0.5 here.
+    y_true_bin = tf.cast(y_true_b >= 0.5, tf.float32)
+    if int(class_index) == 0:
+        return (1.0 - y_true_bin), (1.0 - y_pred_b)
+    else:
+        return y_true_bin, y_pred_b
+
+# --- AUC por clase (PR o ROC) ---
+class AUCClass(tf.keras.metrics.AUC):
+    def __init__(self, class_index: int, curve="PR", name=None, **kw):
+        super().__init__(curve=curve, name=name or f"{curve.lower()}_auc_c{class_index}", **kw)
+        self.class_index = int(class_index)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        return super().update_state(y_true, y_pred, sample_weight)
+
+# --- contadores TP/TN/FP/FN por clase (umbral 0.5) ---
+class TruePositivesClass(tf.keras.metrics.Metric):
+    def __init__(self, class_index: int, threshold=0.5, name=None, **kw):
+        super().__init__(name=name or f"tp_c{class_index}", **kw)
+        self.class_index = int(class_index); self.threshold = float(threshold)
+        self.tp = self.add_weight(name="tp", shape=(), initializer="zeros", dtype=self.dtype)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        y_hat = tf.cast(y_pred >= self.threshold, self.dtype)
+        y_true = tf.cast(y_true, self.dtype)
+        val = y_hat * y_true
+        if sample_weight is not None:
+            val = tf.cast(sample_weight, self.dtype) * val
+        self.tp.assign_add(tf.reduce_sum(val))
+    def result(self): return self.tp
+    def reset_states(self): self.tp.assign(0.0)
+
+class TrueNegativesClass(tf.keras.metrics.Metric):
+    def __init__(self, class_index: int, threshold=0.5, name=None, **kw):
+        super().__init__(name=name or f"tn_c{class_index}", **kw)
+        self.class_index = int(class_index); self.threshold = float(threshold)
+        self.tn = self.add_weight(name="tn", shape=(), initializer="zeros", dtype=self.dtype)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        y_hat = tf.cast(y_pred >= self.threshold, self.dtype)
+        y_true = tf.cast(y_true, self.dtype)
+        val = (1.0 - y_hat) * (1.0 - y_true)
+        if sample_weight is not None:
+            val = tf.cast(sample_weight, self.dtype) * val
+        self.tn.assign_add(tf.reduce_sum(val))
+    def result(self): return self.tn
+    def reset_states(self): self.tn.assign(0.0)
+
+class FalsePositivesClass(tf.keras.metrics.Metric):
+    def __init__(self, class_index: int, threshold=0.5, name=None, **kw):
+        super().__init__(name=name or f"fp_c{class_index}", **kw)
+        self.class_index = int(class_index); self.threshold = float(threshold)
+        self.fp = self.add_weight(name="fp", shape=(), initializer="zeros", dtype=self.dtype)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        y_hat = tf.cast(y_pred >= self.threshold, self.dtype)
+        y_true = tf.cast(y_true, self.dtype)
+        val = y_hat * (1.0 - y_true)
+        if sample_weight is not None:
+            val = tf.cast(sample_weight, self.dtype) * val
+        self.fp.assign_add(tf.reduce_sum(val))
+    def result(self): return self.fp
+    def reset_states(self): self.fp.assign(0.0)
+
+class FalseNegativesClass(tf.keras.metrics.Metric):
+    def __init__(self, class_index: int, threshold=0.5, name=None, **kw):
+        super().__init__(name=name or f"fn_c{class_index}", **kw)
+        self.class_index = int(class_index); self.threshold = float(threshold)
+        self.fn = self.add_weight(name="fn", shape=(), initializer="zeros", dtype=self.dtype)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        y_hat = tf.cast(y_pred >= self.threshold, self.dtype)
+        y_true = tf.cast(y_true, self.dtype)
+        val = (1.0 - y_hat) * y_true
+        if sample_weight is not None:
+            val = tf.cast(sample_weight, self.dtype) * val
+        self.fn.assign_add(tf.reduce_sum(val))
+    def result(self): return self.fn
+    def reset_states(self): self.fn.assign(0.0)
+
+# --- Precision y Recall por clase (Keras ya ofrece class_id, pero este wrapper respeta sample_weight binario) ---
+class PrecisionClass(tf.keras.metrics.Precision):
+    def __init__(self, class_index: int, name=None, **kw):
+        super().__init__(name=name or f"precision_c{class_index}", **kw)
+        self.class_index = int(class_index)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        return super().update_state(y_true, y_pred, sample_weight)
+
+class RecallClass(tf.keras.metrics.Recall):
+    def __init__(self, class_index: int, name=None, **kw):
+        super().__init__(name=name or f"recall_c{class_index}", **kw)
+        self.class_index = int(class_index)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        return super().update_state(y_true, y_pred, sample_weight)
+
+# --- métricas “At …” por clase (basadas en curvas internas) ---
+class PrecisionAtRecallClass(tf.keras.metrics.PrecisionAtRecall):
+    def __init__(self, class_index: int, recall=0.90, name=None, **kw):
+        super().__init__(recall=recall, name=name or f"precision_at_recall{int(100*recall)}_c{class_index}", **kw)
+        self.class_index = int(class_index)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        return super().update_state(y_true, y_pred, sample_weight)
+
+class RecallAtPrecisionClass(tf.keras.metrics.RecallAtPrecision):
+    def __init__(self, class_index: int, precision=0.90, name=None, **kw):
+        super().__init__(precision=precision, name=name or f"recall_at_precision{int(100*precision)}_c{class_index}", **kw)
+        self.class_index = int(class_index)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        return super().update_state(y_true, y_pred, sample_weight)
+
+class SensitivityAtSpecificityClass(tf.keras.metrics.SensitivityAtSpecificity):
+    def __init__(self, class_index: int, specificity=0.995, name=None, **kw):
+        super().__init__(specificity=specificity, name=name or f"sensitivity_at_spec{int(1000*specificity)}_c{class_index}", **kw)
+        self.class_index = int(class_index)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        return super().update_state(y_true, y_pred, sample_weight)
+
+class SpecificityAtSensitivityClass(tf.keras.metrics.SpecificityAtSensitivity):
+    def __init__(self, class_index: int, sensitivity=0.90, name=None, **kw):
+        super().__init__(sensitivity=sensitivity, name=name or f"specificity_at_sens{int(100*sensitivity)}_c{class_index}", **kw)
+        self.class_index = int(class_index)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        return super().update_state(y_true, y_pred, sample_weight)
+
+# --- F1 por clase con umbral fijo (rápido y estable) ---
+class F1Class(tf.keras.metrics.Metric):
+    def __init__(self, class_index: int, threshold=0.5, name=None, **kw):
+        super().__init__(name=name or f"f1_c{class_index}", **kw)
+        self.class_index = int(class_index)
+        self.threshold = float(threshold)
+        self.tp = self.add_weight(name="tp", shape=(), initializer="zeros", dtype=self.dtype)
+        self.fp = self.add_weight(name="fp", shape=(), initializer="zeros", dtype=self.dtype)
+        self.fn = self.add_weight(name="fn", shape=(), initializer="zeros", dtype=self.dtype)
+    def update_state(self, y_true, y_pred, sample_weight=None):
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        y_true = tf.cast(y_true, tf.float32)
+        y_hat = tf.cast(y_pred >= self.threshold, tf.float32)
+        tp = y_hat * y_true
+        fp = y_hat * (1.0 - y_true)
+        fn = (1.0 - y_hat) * y_true
+        if sample_weight is not None:
+            sw = tf.cast(sample_weight, tf.float32)
+            tp = sw * tp; fp = sw * fp; fn = sw * fn
+        self.tp.assign_add(tf.reduce_sum(tp))
+        self.fp.assign_add(tf.reduce_sum(fp))
+        self.fn.assign_add(tf.reduce_sum(fn))
+    def result(self):
+        precision = tf.math.divide_no_nan(self.tp, self.tp + self.fp)
+        recall    = tf.math.divide_no_nan(self.tp, self.tp + self.fn)
+        return tf.math.divide_no_nan(2.0 * precision * recall, precision + recall)
+    def reset_states(self):
+        for v in (self.tp, self.fp, self.fn): v.assign(0.0)
+
+# --- Balanced Accuracy y Brier (útiles para balance/calibración, independientes de la clase) ---
 class BalancedAccuracy(tf.keras.metrics.Metric):
-    """BA = 0.5*(TPR + TNR) a umbral fijo."""
-    def __init__(self, threshold=0.5, name="balanced_accuracy", dtype=tf.float32, **kwargs):
-        super().__init__(name=name, dtype=dtype, **kwargs)
-        self.th = float(threshold)
+    def __init__(self, class_index: int = 1, threshold=0.5, name="balanced_accuracy", **kw):
+        super().__init__(name=name, **kw)
+        self.class_index = int(class_index)
+        self.threshold = float(threshold)
         self.tp = self.add_weight(name="tp", shape=(), initializer="zeros", dtype=self.dtype)
         self.tn = self.add_weight(name="tn", shape=(), initializer="zeros", dtype=self.dtype)
         self.fp = self.add_weight(name="fp", shape=(), initializer="zeros", dtype=self.dtype)
         self.fn = self.add_weight(name="fn", shape=(), initializer="zeros", dtype=self.dtype)
-
     def update_state(self, y_true, y_pred, sample_weight=None):
-        yt, yp = _to_binary_vectors(y_true, y_pred)
-        ytb = yt >= 0.5
-        ypb = yp >= self.th
-
-        tp = tf.reduce_sum(tf.cast(tf.logical_and(ytb, ypb), self.dtype))
-        fn = tf.reduce_sum(tf.cast(tf.logical_and(ytb, tf.logical_not(ypb)), self.dtype))
-        tn = tf.reduce_sum(tf.cast(tf.logical_and(tf.logical_not(ytb), tf.logical_not(ypb)), self.dtype))
-        fp = tf.reduce_sum(tf.cast(tf.logical_and(tf.logical_not(ytb), ypb), self.dtype))
-
-        self.tp.assign_add(tp); self.fn.assign_add(fn)
-        self.tn.assign_add(tn); self.fp.assign_add(fp)
-
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        y_true = tf.cast(y_true, tf.float32)
+        y_hat  = tf.cast(y_pred >= self.threshold, tf.float32)
+        tp = y_hat * y_true
+        tn = (1.0 - y_hat) * (1.0 - y_true)
+        fp = y_hat * (1.0 - y_true)
+        fn = (1.0 - y_hat) * y_true
+        if sample_weight is not None:
+            sw = tf.cast(sample_weight, tf.float32)
+            tp = sw * tp; tn = sw * tn; fp = sw * fp; fn = sw * fn
+        self.tp.assign_add(tf.reduce_sum(tp))
+        self.tn.assign_add(tf.reduce_sum(tn))
+        self.fp.assign_add(tf.reduce_sum(fp))
+        self.fn.assign_add(tf.reduce_sum(fn))
     def result(self):
         tpr = tf.math.divide_no_nan(self.tp, self.tp + self.fn)
         tnr = tf.math.divide_no_nan(self.tn, self.tn + self.fp)
         return 0.5 * (tpr + tnr)
+    def reset_states(self):
+        for v in (self.tp, self.tn, self.fp, self.fn): v.assign(0.0)
 
-    def reset_state(self):
-        for v in (self.tp, self.tn, self.fp, self.fn):
-            v.assign(0.0)
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"threshold": self.th})
-        return cfg
-
-
-class BrierScore(tf.keras.metrics.Metric):
-    """Brier score (MSE de probas de clase positiva)."""
-    def __init__(self, name="brier_score", dtype=tf.float32, **kwargs):
-        super().__init__(name=name, dtype=dtype, **kwargs)
-        self.sum_err = self.add_weight(name="sum_err", shape=(), initializer="zeros", dtype=self.dtype)
-        self.count   = self.add_weight(name="count",   shape=(), initializer="zeros", dtype=self.dtype)
-
+class BrierPos(tf.keras.metrics.Metric):
+    def __init__(self, class_index: int = 1, name="brier_pos", **kw):
+        super().__init__(name=name, **kw)
+        self.class_index = int(class_index)
+        self.total = self.add_weight(name="total", shape=(), initializer="zeros", dtype=self.dtype)
+        self.count = self.add_weight(name="count", shape=(), initializer="zeros", dtype=self.dtype)
     def update_state(self, y_true, y_pred, sample_weight=None):
-        yt, yp = _to_binary_vectors(y_true, y_pred)
-        err = tf.square(yp - yt)
-        self.sum_err.assign_add(tf.reduce_sum(err))
-        self.count.assign_add(tf.cast(tf.size(yt), self.dtype))
+        y_true, y_pred = _select_col(y_true, y_pred, self.class_index)
+        err = tf.square(y_pred - y_true)
+        if sample_weight is not None:
+            sw = tf.cast(sample_weight, tf.float32)
+            err = sw * err
+            n = tf.reduce_sum(sw)
+        else:
+            n = tf.cast(tf.size(err), tf.float32)
+        self.total.assign_add(tf.reduce_sum(err))
+        self.count.assign_add(n)
+    def result(self): return tf.math.divide_no_nan(self.total, self.count)
+    def reset_states(self): self.total.assign(0.0); self.count.assign(0.0)
 
-    def result(self):
-        return tf.math.divide_no_nan(self.sum_err, self.count)
-
-    def reset_state(self):
-        self.sum_err.assign(0.0); self.count.assign(0.0)
-
-
-class SpecificityAtThreshold(tf.keras.metrics.Metric):
-    """Especificidad (TNR) a umbral fijo."""
-    def __init__(self, threshold=0.5, name=None, dtype=tf.float32, **kwargs):
-        super().__init__(name=name or f"specificity@t={threshold:.2f}", dtype=dtype, **kwargs)
-        self.th = float(threshold)
-        self.tn = self.add_weight(name="tn", shape=(), initializer="zeros", dtype=self.dtype)
-        self.fp = self.add_weight(name="fp", shape=(), initializer="zeros", dtype=self.dtype)
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        yt, yp = _to_binary_vectors(y_true, y_pred)
-        ytb = yt >= 0.5
-        ypb = yp >= self.th
-
-        tn = tf.reduce_sum(tf.cast(tf.logical_and(tf.logical_not(ytb), tf.logical_not(ypb)), self.dtype))
-        fp = tf.reduce_sum(tf.cast(tf.logical_and(tf.logical_not(ytb), ypb), self.dtype))
-
-        self.tn.assign_add(tn); self.fp.assign_add(fp)
-
-    def result(self):
-        return tf.math.divide_no_nan(self.tn, self.tn + self.fp)
-
-    def reset_state(self):
-        self.tn.assign(0.0); self.fp.assign(0.0)
-
-    def get_config(self):
-        cfg = super().get_config()
-        cfg.update({"threshold": self.th})
-        return cfg
-
-class AUCfp32(tf.keras.metrics.AUC):
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        y_true = tf.cast(y_true, tf.float32)
-        y_pred = tf.cast(y_pred, tf.float32)
-        return super().update_state(y_true, y_pred, sample_weight)
-
-class SensAtSpec_fp32(tf.keras.metrics.SensitivityAtSpecificity):
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        return super().update_state(tf.cast(y_true, tf.float32), tf.cast(y_pred, tf.float32), sample_weight)
-
-class SpecAtSens_fp32(tf.keras.metrics.SpecificityAtSensitivity):
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        return super().update_state(tf.cast(y_true, tf.float32), tf.cast(y_pred, tf.float32), sample_weight)
-
-class ShapeAwareWrapper(tf.keras.metrics.Metric):
+class ParetoCheckpointMulti(tf.keras.callbacks.Callback):
     """
-    Envuelve una métrica Keras: vectoriza y opcionalmente binariza y_true (>=0.5).
-    Útil para Recall/Precision a umbral y Sens/Spec nativas cuando hay soft labels.
+    Guarda el modelo cuando el vector de métricas 'metrics' (con direcciones en 'directions')
+    domina al mejor hasta ahora (tolerancias 'eps'). Opcionalmente aplica 'constraints'
+    (p.ej. ("val_fa_per_24h", "<=", 2.0)). Mantiene UN mejor vector (no archivo Pareto).
     """
-    def __init__(self, inner_metric, name=None, dtype=tf.float32, apply_vectorize=True, binarize_true=True, **kwargs):
-        super().__init__(name=name or getattr(inner_metric, "name", "wrapped_metric"), dtype=dtype, **kwargs)
-        self.inner = inner_metric
-        self.apply_vectorize = bool(apply_vectorize)
-        self.binarize_true = bool(binarize_true)
-
-    def update_state(self, y_true, y_pred, sample_weight=None):
-        yt, yp = (y_true, y_pred)
-        if self.apply_vectorize:
-            yt, yp = _to_binary_vectors(yt, yp)
-        if self.binarize_true:
-            yt = tf.cast(yt >= 0.5, tf.float32)
-        return self.inner.update_state(yt, yp, sample_weight=sample_weight)
-
-    def result(self): return self.inner.result()
-    def reset_state(self):
-        if hasattr(self.inner, "reset_state"):
-            self.inner.reset_state()
-
-    def get_config(self):
-        cfg = super().get_config()
-        try:
-            inner_cfg = tf.keras.utils.serialize_keras_object(self.inner)
-        except Exception:
-            inner_cfg = {"class_name": self.inner.__class__.__name__,
-                         "config": getattr(self.inner, "get_config", lambda: {})()}
-        cfg.update({"inner_metric": inner_cfg, "apply_vectorize": self.apply_vectorize, "binarize_true": self.binarize_true})
-        return cfg
-
-    @classmethod
-    def from_config(cls, config):
-        inner_cfg = config.pop("inner_metric", None)
-        inner = tf.keras.utils.deserialize_keras_object(inner_cfg) if isinstance(inner_cfg, dict) and "class_name" in inner_cfg else None
-        return cls(inner_metric=inner, **config)
-          
-# ======================== PÉRDIDAS ===========================================
-try:
-    from tensorflow.keras.losses import BinaryFocalCrossentropy, CategoricalFocalCrossentropy
-    HAVE_FOCAL = True
-except Exception:
-    HAVE_FOCAL = False
-
-def make_loss(is_onehot: bool):
-    if is_onehot:
-        loss_obj = (CategoricalFocalCrossentropy(alpha=[0.25, 0.75], gamma=2.0, label_smoothing=0.1)
-                    if HAVE_FOCAL else
-                    tf.keras.losses.CategoricalCrossentropy(label_smoothing=0.05))
-        def loss(y_true, y_pred):
-            if TIME_STEP and y_true.shape.rank == 2 and y_pred.shape.rank == 3:
-                # (B,2) → (B,T,2) usando broadcast (XLA‑friendly)
-                y_true2 = tf.broadcast_to(tf.expand_dims(y_true, axis=1), tf.shape(y_pred))
-            else:
-                y_true2 = y_true
-            return loss_obj(y_true2, y_pred)
-        return loss
-    else:
-        loss_obj = (BinaryFocalCrossentropy(alpha=0.75, gamma=2.0, label_smoothing=0.1)
-                    if HAVE_FOCAL else
-                    tf.keras.losses.BinaryCrossentropy(label_smoothing=0.05))
-        def loss(y_true, y_pred):
-            # y_pred esperado (B,T,1) → (B,T)
-            yp = y_pred
-            if yp.shape.rank == 3 and yp.shape[-1] == 1:
-                yp = tf.squeeze(yp, axis=-1)
-            # y_true puede venir como (B,), (B,1), (B,T) o (B,T,1) → forzamos (B,T)
-            yt = tf.cast(y_true, yp.dtype)
-            if yt.shape.rank == 3 and yt.shape[-1] == 1:
-                yt = tf.squeeze(yt, axis=-1)                   # (B,T)
-            elif yt.shape.rank == 1:
-                yt = tf.expand_dims(yt, axis=-1)               # (B,1)
-            # ahora broadcast a (B,T) (sirve tanto si es (B,1) como si ya es (B,T))
-            yt = tf.broadcast_to(yt, [tf.shape(yp)[0], tf.shape(yp)[1]])
-            return loss_obj(yt, yp)
-        return loss
-# ======================== NOMBRES DE MÉTRICAS =================================
-def _mn_sens_at_spec(s): return f"sens@spec>={s:.2f}"
-def _mn_spec_at_sens(s): return f"spec@sens>={s:.2f}"
-def _mn_recall_t(t):     return f"recall@t={t:.2f}"
-def _mn_spec_t(t):       return f"specificity@t={t:.2f}"
-def _mn_tp_t(t):         return f"TP@t={t:.2f}"
-def _mn_tn_t(t):         return f"TN@t={t:.2f}"
-def _mn_fp_t(t):         return f"FP@t={t:.2f}"
-def _mn_fn_t(t):         return f"FN@t={t:.2f}"
-def _mn_ba_t(t):         return f"balanced_accuracy@t={t:.2f}"
-def _mn_prec_t(t):       return f"precision@t={t:.2f}" 
-
-# ======================== MÉTRICAS ===========================================
-def make_metrics(is_onehot: bool):
-    
-    base = []
-    if is_onehot: base += [tf.keras.metrics.CategoricalAccuracy(name="accuracy")]
-    else:         base += [tf.keras.metrics.BinaryAccuracy(name="accuracy")]
-    base += [AUCfp32(curve="PR", name="auc_pr"), AUCfp32(curve="ROC", name="auc_roc")]
-    if LIGHT_TRAIN_METRICS:
-        return base
-    else: mets = base
-    # Versiones a umbral fijo + cuentas de la matriz de confusión
-    for t in THRESHOLDS:
-        mets += [ShapeAwareWrapper(tf.keras.metrics.Recall(thresholds=[t]),    name=_mn_recall_t(t))]
-        mets += [SpecificityAtThreshold(threshold=t,                          name=_mn_spec_t(t))]
-        mets += [ShapeAwareWrapper(tf.keras.metrics.Precision(thresholds=[t]), name=_mn_prec_t(t))]  # <---
-        mets += [
-            ShapeAwareWrapper(tf.keras.metrics.TruePositives(thresholds=[t]),  name=_mn_tp_t(t)),
-            ShapeAwareWrapper(tf.keras.metrics.TrueNegatives(thresholds=[t]),  name=_mn_tn_t(t)),
-            ShapeAwareWrapper(tf.keras.metrics.FalsePositives(thresholds=[t]), name=_mn_fp_t(t)),
-            ShapeAwareWrapper(tf.keras.metrics.FalseNegatives(thresholds=[t]), name=_mn_fn_t(t)),
-        ]
-        mets += [BalancedAccuracy(threshold=t, name=_mn_ba_t(t))]
-
-    # Objetivos (sin fijar umbral; barrido interno)
-    for s in SENS_AT_SPEC_TARGETS:
-        mets += [ShapeAwareWrapper(tf.keras.metrics.SensitivityAtSpecificity(specificity=s), name=_mn_sens_at_spec(s))]
-    for s in SPEC_AT_SENS_TARGETS:
-        mets += [ShapeAwareWrapper(tf.keras.metrics.SpecificityAtSensitivity(sensitivity=s), name=_mn_spec_at_sens(s))]
-
-    # Alias BA principal (usa el primer umbral)
-    mets += [BalancedAccuracy(threshold=THRESHOLDS[0], name="balanced_accuracy")]
-
-    # Calibración
-    mets += [BrierScore(name="brier_score")]
-    return mets
-
-# ============== LR schedule: Warmup + CosineDecay serializable ================
-import math
-import tensorflow as tf
-
-@tf.keras.utils.register_keras_serializable(package="sched")
-class WarmupCosineSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-    """
-    LR = 
-      - base_lr * (step / warmup_steps)                    si step < warmup_steps
-      - min_lr + (base_lr - min_lr) * 0.5*(1 + cos(pi*z))  en otro caso,
-        z = clip((step - warmup_steps) / (total_steps - warmup_steps), 0..1)
-    """
-    def __init__(self, base_lr, total_steps, warmup_ratio=0.1, min_lr_frac=0.05, name=None):
+    def __init__(self,
+                 filepath: str,
+                 metrics: list,                 # p.ej. ["val_recall_seizure","val_recall_background"]
+                 directions: list,              # p.ej. ["max","max"] o ["max","min",...]
+                 eps: list = None,              # tolerancia por métrica (misma longitud que metrics)
+                 constraints: list = None,      # lista de (key, op, value), p.ej. [("val_fa_per_24h","<=",2.0)]
+                 save_weights_only: bool = False,
+                 verbose: int = 1):
         super().__init__()
-        # Guarda parámetros como float/int nativos (serializables)
-        self.base_lr      = float(base_lr)
-        self.total_steps  = int(max(1, total_steps))
-        self.warmup_ratio = float(warmup_ratio)
-        self.min_lr_frac  = float(min_lr_frac)
-        self._name        = name or "WarmupCosineSchedule"
-
-        # Precalcula enteros/floats estáticos (NO tensores) en __init__
-        self.warmup_steps = int(max(1, round(self.warmup_ratio * self.total_steps)))
-        self.decay_steps  = max(1, self.total_steps - self.warmup_steps)
-        self.min_lr       = float(self.base_lr * self.min_lr_frac)
-
-    def __call__(self, step):
-        # Asegura dtype consistente para XLA
-        step_f   = tf.cast(step, tf.float32)
-        warm_f   = tf.constant(float(self.warmup_steps), dtype=tf.float32)
-        total_f  = tf.constant(float(self.total_steps),  dtype=tf.float32)
-        base_f   = tf.constant(self.base_lr,             dtype=tf.float32)
-        minlr_f  = tf.constant(self.min_lr,              dtype=tf.float32)
-        one      = tf.constant(1.0,                      dtype=tf.float32)
-        pi       = tf.constant(math.pi,                  dtype=tf.float32)
-
-        # Warmup lineal (evita división por 0)
-        warm_denom = tf.maximum(one, warm_f)
-        warm_lr    = base_f * (step_f / warm_denom)
-
-        # Cosine decay desde min_lr a base_lr
-        decay_denom = tf.maximum(one, total_f - warm_f)
-        progress    = tf.clip_by_value((step_f - warm_f) / decay_denom, 0.0, 1.0)
-        cosine      = 0.5 * (one + tf.cos(pi * progress))
-        decay_lr    = minlr_f + (base_f - minlr_f) * cosine
-
-        # Selección sin funciones anidadas (mejor para XLA)
-        lr = tf.where(step_f < warm_f, warm_lr, decay_lr)
-        return lr
-
-    def get_config(self):
-        return {
-            "base_lr": self.base_lr,
-            "total_steps": self.total_steps,
-            "warmup_ratio": self.warmup_ratio,
-            "min_lr_frac": self.min_lr_frac,
-            "name": self._name,
-        }
-
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-
-# =================== UTILIDADES DATA/LOGGING/CALLBACKS =======================
-def cardinality_safe(ds, fallback_scan=True, max_scan=200000):
-    card = int(tf.data.experimental.cardinality(ds).numpy())
-    if card < 0 and fallback_scan:  # UNKNOWN_CARDINALITY
-        card = sum(1 for _ in ds.take(max_scan))
-    return max(1, card)
-
-class SafeTimeCSVLogger(tf.keras.callbacks.Callback):
-    def __init__(self, filename): super().__init__(); self.filename = filename; self.f=None; self.start=None; self.epoch_start=None
-    def on_train_begin(self, logs=None):
-        self.start = time.time(); self.f = open(self.filename, "w", buffering=1)
-        self.f.write("epoch,epoch_time_seconds,total_time_seconds\n")
-    def on_epoch_begin(self, epoch, logs=None): self.epoch_start = time.time()
-    def on_epoch_end(self, epoch, logs=None):
-        et = time.time() - self.epoch_start; tt = time.time() - self.start
-        self.f.write(f"{epoch},{et:.3f},{tt:.3f}\n")
-    def on_train_end(self, logs=None):
-        if self.f: self.f.close()
-
-class SafeTimeLimitCallback(tf.keras.callbacks.Callback):
-    def __init__(self, max_seconds, grace_seconds=300):
-        super().__init__(); self.max_seconds=max_seconds; self.grace=grace_seconds; self.start=None
-    def on_train_begin(self, logs=None):
-        self.start=time.time(); print(f"⏰ Límite de tiempo: {self.max_seconds/3600:.1f} h")
-    def on_epoch_end(self, epoch, logs=None):
-        if time.time() - self.start > self.max_seconds:
-            print("⏰ Tiempo agotado; deteniendo entrenamiento tras cerrar época."); self.model.stop_training=True
-
-class SafeBackupAndRestore(tf.keras.callbacks.Callback):
-    def __init__(self, backup_dir: Path):
-        super().__init__(); self.dir = Path(backup_dir); self.dir.mkdir(parents=True, exist_ok=True)
-    def on_epoch_end(self, epoch, logs=None):
-        if epoch % 5 == 0 and epoch > 0:
-            path = self.dir / f"backup_epoch_{epoch:03d}.weights.h5"
-            try:
-                self.model.save_weights(str(path))
-                for p in sorted(self.dir.glob("backup_epoch_*.weights.h5"))[:-3]:
-                    p.unlink(missing_ok=True)
-            except Exception as e:
-                print(f"⚠️ Backup warning @epoch {epoch}: {e}")
-
-class ThresholdReportCSV(tf.keras.callbacks.Callback):
-    def __init__(self, run_dir: Path, thresholds, split_keys=("","val_"), filename="reports/threshold_report.csv"):
-        super().__init__()
-        self.thresholds = [float(t) for t in thresholds]
-        self.split_keys = split_keys  # ("", "val_") → train y val
-        self.path = Path(run_dir) / filename
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._header_written = False
+        assert len(metrics) == len(directions), "metrics y directions deben tener misma longitud"
+        self.filepath = filepath
+        self.metrics = metrics
+        self.directions = [d.lower() for d in directions]
+        self.eps = eps if eps is not None else [1e-4] * len(metrics)
+        self.constraints = constraints or []
+        self.save_weights_only = save_weights_only
+        self.verbose = verbose
+        self._best_vec = None   # lista de floats en el orden de self.metrics
 
     @staticmethod
-    def _get(d, k): 
-        v = d.get(k); 
-        return float(v) if v is not None else float("nan")
+    def _ok_constraint(val, op, target):
+        if val is None or not math.isfinite(float(val)):
+            return False
+        if   op == ">=": return val >= target
+        elif op == "<=": return val <= target
+        elif op ==  ">": return val >  target
+        elif op ==  "<": return val <  target
+        elif op == "==": return abs(val - target) < 1e-12
+        else: raise ValueError(f"Operador no soportado: {op}")
+
+    def _dominates(self, cand, best):
+        """cand domina a best si es >= (o <=) con tolerancia en todas y mejora estricta en al menos una."""
+        better_or_equal_all = True
+        strictly_better = False
+        for i, (c, b, dir_i, eps_i) in enumerate(zip(cand, best, self.directions, self.eps)):
+            if dir_i == "max":
+                if c < b - eps_i:   # peor que best
+                    better_or_equal_all = False; break
+                if c > b + eps_i:   # claramente mejor en esta
+                    strictly_better = True
+            elif dir_i == "min":
+                if c > b + eps_i:
+                    better_or_equal_all = False; break
+                if c < b - eps_i:
+                    strictly_better = True
+            else:
+                raise ValueError(f"dirección inválida: {dir_i}")
+        return better_or_equal_all and strictly_better
 
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
-        rows, best_val = [], {"f1": -1, "t": None}
-        for prefix in self.split_keys:  # "" → train, "val_" → val
-            split = "val" if prefix == "val_" else "train"
-            for t in self.thresholds:
-                k = lambda name: f"{prefix}{name}@t={t:.2f}"
-                rec = self._get(logs, k("recall"))
-                spe = self._get(logs, k("specificity"))
-                pre = self._get(logs, k("precision"))
-                tp  = self._get(logs, k("TP"))
-                tn  = self._get(logs, k("TN"))
-                fp  = self._get(logs, k("FP"))
-                fn  = self._get(logs, k("FN"))
-                ba  = self._get(logs, f"{prefix}balanced_accuracy@t={t:.2f}")
-                # F1 a partir de precision/recall si existen
-                denom = (pre + rec) if math.isfinite(pre) and math.isfinite(rec) and (pre+rec)>0 else float("nan")
-                f1 = (2*pre*rec/denom) if math.isfinite(denom) else float("nan")
-                rows.append({
-                    "epoch": epoch+1, "split": split, "t": t,
-                    "tp": tp, "tn": tn, "fp": fp, "fn": fn,
-                    "recall": rec, "specificity": spe, "precision": pre,
-                    "balanced_accuracy": ba, "f1": f1,
-                    # globales del epoch (mismo para todos los t, pero útiles)
-                    "auc_pr": self._get(logs, f"{prefix}auc_pr"),
-                    "auc_roc": self._get(logs, f"{prefix}auc_roc"),
-                    "brier": self._get(logs, f"{prefix}brier_score"),
-                    "loss": self._get(logs, f"{prefix}loss"),
-                })
-                if split == "val" and math.isfinite(f1) and f1 > best_val["f1"]:
-                    best_val = {"f1": f1, "t": t}
 
-        # escribe CSV (append)
-        write_header = not self._header_written and not self.path.exists()
-        import csv
-        with open(self.path, "a", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            if write_header: w.writeheader(); self._header_written = True
-            w.writerows(rows)
+        # 1) Chequear restricciones (si las hay)
+        for key, op, target in self.constraints:
+            v = logs.get(key, None)
+            if not self._ok_constraint(float(v) if v is not None else None, op, float(target)):
+                return  # no guarda si no cumple la puerta
 
-        # print resumen del mejor F1 en val
-        if best_val["t"] is not None:
-            print(f"\n🔎 Epoch {epoch+1}: mejor F1(val)={best_val['f1']:.4f} @ t={best_val['t']:.2f}  → {self.path}")
+        # 2) Construir vector candidato
+        cand = []
+        for k in self.metrics:
+            v = logs.get(k, None)
+            if v is None or not math.isfinite(float(v)):
+                return  # alguna métrica no disponible todavía
+            cand.append(float(v))
 
-def _sanitize_monitor_for_filename(monitor: str) -> str:
-    s = monitor.lower().replace("val_", "")
-    s = re.sub(r"[^a-z0-9]+", "_", s); s = re.sub(r"_+", "_", s).strip("_")
-    return s
+        # 3) Primera vez: guardar
+        if self._best_vec is None:
+            self._best_vec = cand
+            path = self.filepath.format(epoch=epoch+1, **{m: v for m, v in zip(self.metrics, cand)})
+            if self.save_weights_only:
+                self.model.save_weights(path)
+            else:
+                self.model.save(path)
+            if self.verbose:
+                print(f"\n[pareto_multi] saved (init): {path}  " +
+                      " ".join([f"{m}={v:.4f}" for m, v in zip(self.metrics, cand)]))
+            return
 
-def make_callbacks(run_dir: Path, primary_monitor="val_auc_pr", secondary_monitors=None):
-    run_dir.mkdir(parents=True, exist_ok=True)
-    cbs = [
-        tf.keras.callbacks.CSVLogger(str(run_dir / "training_log.csv")),
-        SafeTimeCSVLogger(str(run_dir / "training_log_with_times.csv")),
-        tf.keras.callbacks.TerminateOnNaN(),
-        tf.keras.callbacks.EarlyStopping(monitor=primary_monitor, mode="max", patience=15, restore_best_weights=True),
-        tf.keras.callbacks.TensorBoard(log_dir=str(run_dir / "tb"), write_graph=False, write_images=False),
-        SafeTimeLimitCallback(TIME_LIMIT_H * 3600, grace_seconds=300),
-        SafeBackupAndRestore(run_dir / "backups"),
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=str(run_dir / "best_by_primary.weights.h5"),
-            monitor=primary_monitor, mode="max",
-            save_best_only=True, save_weights_only=True
-        ),
-    ]
-    if secondary_monitors:
-        for m in secondary_monitors:
-            cbs.append(tf.keras.callbacks.ModelCheckpoint(
-                filepath=str(run_dir / f"best_by_{_sanitize_monitor_for_filename(m)}.weights.h5"),
-                monitor=m, mode="max", save_best_only=True, save_weights_only=True
-            ))
-    print(f"✅ Callbacks: {len(cbs)} | primary: {primary_monitor} | secondary: {secondary_monitors or []}")
-    return cbs
+        # 4) Comparar y guardar si domina
+        if self._dominates(cand, self._best_vec):
+            self._best_vec = cand
+            path = self.filepath.format(epoch=epoch+1, **{m: v for m, v in zip(self.metrics, cand)})
+            if self.save_weights_only:
+                self.model.save_weights(path)
+            else:
+                self.model.save(path)
+            if self.verbose:
+                print(f"\n[pareto_multi] saved: {path}  " +
+                      " ".join([f"{m}={v:.4f}" for m, v in zip(self.metrics, cand)]))
 
-# === Callback de ETA ligero (imprime cada N s una sola línea por época) ======
-class LightETA(tf.keras.callbacks.Callback):
-    def __init__(self, train_steps, print_every_sec=20, track=("loss", "accuracy")):
-        super().__init__()
-        self.train_steps = int(train_steps) if train_steps else None
-        self.print_every = float(print_every_sec)
-        self.track = tuple(track)
-        self._last = 0.0; self._epoch_start = 0.0; self._batch = 0
-        self._ema = {k: None for k in self.track}
+# =================================================================================================================
+# Loss Functions
+# =================================================================================================================
 
-    def _get_lr(self):
-        try:
-            it = int(self.model.optimizer.iterations.numpy())
-            lr = self.model.optimizer.learning_rate
-            if callable(getattr(lr, "__call__", None)):
-                return float(lr(it).numpy())
-            return float(tf.keras.backend.get_value(lr))
-        except Exception:
-            try: return float(tf.keras.backend.get_value(self.model.optimizer.lr))
-            except Exception: return float("nan")
+def focal_loss(gamma=2.0, alpha=0.25):
+    def loss_fn(y_true, y_pred):
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
+        pt = tf.where(tf.equal(y_true, 1), y_pred, 1 - y_pred)
+        return -alpha * tf.pow(1 - pt, gamma) * tf.math.log(pt)
+    def wrapped(y_true, y_pred):
+        return tf.reduce_mean(loss_fn(y_true, y_pred))
+    return wrapped
 
-    def on_epoch_begin(self, epoch, logs=None):
-        self._epoch_start = time.time(); self._batch = 0
-        for k in self._ema: self._ema[k] = None
-        print(f"\nEpoch {epoch+1}/{self.params.get('epochs','?')} ...", flush=True)
-        self._last = self._epoch_start
+# =================================================================================================================
+# Pipeline Functions
+# =================================================================================================================
 
-    def on_train_batch_end(self, batch, logs=None):
-        self._batch += 1
-        now = time.time()
-        if logs:
-            for k in self.track:
-                v = logs.get(k)
-                if v is not None:
-                    prev = self._ema[k]
-                    self._ema[k] = v if prev is None else (0.9*prev + 0.1*v)
-        if now - self._last >= self.print_every and self.train_steps:
-            elapsed = now - self._epoch_start
-            done = min(self._batch, self.train_steps)
-            speed = done / elapsed if elapsed > 0 else 0.0
-            remain = (self.train_steps - done) / speed if speed > 0 else float("inf")
-            lr = self._get_lr()
-            mets = " ".join(f"{k}={self._ema[k]:.4f}" for k in self.track if self._ema[k] is not None)
-            print(
-                f"\r  {done:>5}/{self.train_steps:<5} "
-                f"({done/self.train_steps:5.1%})  "
-                f"ETA {remain/60:5.1f}m  "
-                f"spd {speed:4.1f} it/s  "
-                f"lr {lr:.2e}  {mets}",
-                end="", flush=True
-            )
-            self._last = now
 
-    def on_epoch_end(self, epoch, logs=None):
-        elapsed = time.time() - self._epoch_start
-        mets = " ".join(f"{k}={logs.get(k):.4f}" for k in self.track if logs and k in logs)
-        print(f"\r  done in {elapsed:5.1f}s  {mets}".ljust(100), flush=True)
+def inspect_dataset(ds: tf.data.Dataset, num_batches: int | None = 3, positive_label: int = 1):
+    """Ligero y compatible con todos los modos (time-step/window, one-hot/binario, soft):
+    - Itera pocas batches (por defecto 3)
+    - Inferencia de formas para contar positivos y total
+    - En soft labels, umbraliza a 0.5
+    """
+    total_items = 0
+    total_pos = 0
 
-# ========================= DATASETS ==========================================
-def make_datasets(tfrecord_dir: str, n_channels: int, n_timepoints: int):
-    train_glob = os.path.join(tfrecord_dir, 'train', '*.tfrecord')
-    val_glob   = os.path.join(tfrecord_dir, 'val',   '*.tfrecord')
-
-    def _resolve(pat):
-        if '*' in pat:
-            files = sorted(glob.glob(pat)); return files or []
-        return [pat] if os.path.exists(pat) else []
-
-    train_files = _resolve(train_glob) or _resolve(os.path.join(tfrecord_dir, 'train.tfrecord'))
-    val_files   = _resolve(val_glob)   or _resolve(os.path.join(tfrecord_dir, 'val.tfrecord'))
-
-    if not train_files:
-        raise FileNotFoundError(f"No se encontraron TFRecords de entrenamiento en {tfrecord_dir}")
-
-    train_ds = create_dataset_final(
-        train_files, n_channels=n_channels, n_timepoints=n_timepoints,
-        batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
-        shuffle=True, balance_pos_frac=BALANCE_POS_FRAC,
-        drop_remainder=True, window_mode=WINDOW_MODE
-    )
-    val_ds = create_dataset_final(
-        val_files or train_files, n_channels=n_channels, n_timepoints=n_timepoints,
-        batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
-        shuffle=False, balance_pos_frac=None,
-        drop_remainder=True, window_mode=WINDOW_MODE
-    )
-    return train_ds, val_ds
-
-def inspect_dataset(ds, batches=None, pos_label=1):
-    tot, pos = 0, 0
-    it = ds if batches is None else ds.take(batches)
-    for _, y in it:
-        y = y.numpy()
-        if y.ndim > 1 and y.shape[-1] > 1:  # one-hot
-            y_hard = (np.argmax(y, axis=-1) == pos_label)
+    it = ds if num_batches is None else ds.take(num_batches)
+    for eeg_batch, y_batch in it:
+        y = y_batch
+        y_np = y.numpy()
+        # Handle one-hot → class indices
+        if y_np.ndim >= 1 and y_np.shape[-1] == 2:
+            y_np = np.argmax(y_np, axis=-1)
         else:
-            y_hard = (y > 0.5)  # soporta 'soft' y 'default'
-        tot += y.size
-        pos += int(y_hard.sum())
-    prev = (pos / tot) if tot else 0.0
-    print(f"Dataset windows: {tot} | positivos: {pos} ({prev:.2%})")
+            # squeeze last dim if (..,1)
+            if y_np.ndim >= 1 and y_np.shape[-1] == 1:
+                y_np = np.squeeze(y_np, axis=-1)
+            # soft labels (float in [0,1]) → binarize at 0.5
+            if y_np.dtype != np.int64 and y_np.dtype != np.int32:
+                y_np = (y_np >= 0.5).astype(np.int32)
 
-# ========================= PIPELINE PRINCIPAL ================================
-def pipeline(data_root: str, n_channels=22):
-    # TFRecords
-    if WRITE_TFREC:
-        print("🎯 PIPELINE DEFINITIVO CORREGIDO:", TFRECORD_DIR)
-        write_tfrecord_splits_FINAL_CORRECTED(
-            data_root, TFRECORD_DIR, montage='ar',
-            resample_fs=FS_TARGET, limits=LIMITS,
-            window_sec=WINDOW_SEC, hop_sec=FRAME_HOP_SEC
+        # Now y_np is integers 0/1 possibly with time axis; count all elements
+        total_items += y_np.size
+        total_pos += int((y_np == positive_label).sum())
+
+    prev = (total_pos / total_items) if total_items else 0.0
+    print(f"\nTotal: {total_pos}/{total_items} positives → {prev:.2%} prevalence")
+
+def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write_ds=True, limits=None):
+
+    if write_ds:
+        write_tfrecord_splits_FINAL_CORRECTED(data_dir, TFRECORD_DIR, montage='ar', resample_fs=PREPROCESS['resample'], limits=limits, window_sec=WINDOW_SEC, hop_sec=FRAME_HOP_SEC)
+    # respetar el parámetro n_channels recibido
+    # Save run configuration snapshot
+    save_run_config(RUN_DIR, extra={
+        "n_channels": n_channels,
+        "n_timepoints": n_timepoints,
+        "data_dir": data_dir,
+    })
+
+    # Prefer sharded per-EDF datasets if present, else fallback to monolith
+    train_glob = os.path.join(TFRECORD_DIR, 'train', '*.tfrecord')
+    val_glob   = os.path.join(TFRECORD_DIR, 'val', '*.tfrecord')
+    train_files = sorted(glob.glob(train_glob))
+    val_files   = sorted(glob.glob(val_glob))
+    if len(train_files) == 0:
+        mono_train = os.path.join(TFRECORD_DIR, 'train.tfrecord')
+        if os.path.exists(mono_train):
+            train_files = [mono_train]
+    if len(val_files) == 0:
+        mono_val = os.path.join(TFRECORD_DIR, 'val.tfrecord')
+        if os.path.exists(mono_val):
+            val_files = [mono_val]
+    if len(train_files) == 0:
+        raise FileNotFoundError(f"No TFRecord files found for training in '{TFRECORD_DIR}'. Looked for {train_glob} and train.tfrecord")
+    if len(val_files) == 0:
+        raise FileNotFoundError(f"No TFRecord files found for validation in '{TFRECORD_DIR}'. Looked for {val_glob} and val.tfrecord")
+
+    train_paths = train_files
+    val_paths   = val_files
+
+    def _make_train_ds(paths):
+        return create_dataset_final_v2(
+            paths,
+            n_channels=n_channels,
+            n_timepoints=n_timepoints,
+            batch_size=BATCH_SIZE,
+            one_hot=ONEHOT,
+            time_step=TIME_STEP,
+            shuffle=True,
+            balance_pos_frac=None,
+            sample_rate=PREPROCESS['resample'],
+            window_mode=WINDOW_MODE,
+            feature_names=FEATURE_NAMES,
+            return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP)
+        )
+    def _make_count_ds(paths):
+        return create_dataset_final_v2(
+            paths,
+            n_channels=n_channels,
+            n_timepoints=n_timepoints,
+            batch_size=BATCH_SIZE,
+            one_hot=ONEHOT,
+            time_step=TIME_STEP,
+            shuffle=False,
+            balance_pos_frac=None,
+            sample_rate=PREPROCESS['resample'],
+            window_mode=WINDOW_MODE,
+            feature_names=FEATURE_NAMES,
+            return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP)
+        )
+    # Count steps safely (cardinality may be UNKNOWN due to flat_map)
+    _count_ds = _make_count_ds(train_paths)
+    card = tf.data.experimental.cardinality(_count_ds)
+    if card == tf.data.experimental.UNKNOWN_CARDINALITY:
+        steps_per_epoch = sum(1 for _ in _count_ds)
+    else:
+        steps_per_epoch = int(card.numpy())
+    print("steps_per_epoch:", steps_per_epoch)
+
+    # Rebuild clean datasets for fit()
+    train_ds = _make_train_ds(train_paths).repeat()
+
+    est_epochs_budget = 20
+    est_total_steps = int(est_epochs_budget * steps_per_epoch)
+    warmup_steps    = max(1, int(WARMUP_RATIO * est_total_steps))
+    decay_steps     = max(1, est_total_steps - warmup_steps)
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecay(
+        initial_learning_rate=LEARNING_RATE,
+        decay_steps=decay_steps,
+        alpha=MIN_LR_FRACTION,
+        warmup_target=LEARNING_RATE,
+        warmup_steps=warmup_steps
+    )
+
+    val_ds = create_dataset_final_v2(
+        val_paths,
+        n_channels=n_channels,
+        n_timepoints=n_timepoints,
+        batch_size=BATCH_SIZE,
+        one_hot=ONEHOT,
+        time_step=TIME_STEP,
+        shuffle=False,
+        balance_pos_frac=None,
+        sample_rate=PREPROCESS['resample'],
+        window_mode=WINDOW_MODE,
+    feature_names=FEATURE_NAMES,
+    return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP)
+     )
+
+    inspect_dataset(_count_ds)
+    inspect_dataset(val_ds)
+
+    # Compute effective input channels and whether we have a separate features vector
+    eff_channels = n_channels
+    use_feat_vec = (FEATURES_AS_VECTOR and WINDOW_MODE == "features" and not TIME_STEP)
+    feat_input_dim = len(FEATURE_NAMES) if (WINDOW_MODE == "features" and not TIME_STEP and FEATURES_AS_VECTOR) else None
+    if WINDOW_MODE == "features" and not TIME_STEP and not FEATURES_AS_VECTOR:
+        # concatenated to channels per time step
+        eff_channels = n_channels + len(FEATURE_NAMES)
+
+    strategy = tf.distribute.OneDeviceStrategy("GPU:0")
+    with strategy.scope():
+        # Loss selection respects FOCAL flag
+        if ONEHOT:
+            loss_fn = (CategoricalFocalCrossentropy(alpha=[0.25, 0.55], gamma=1.5, label_smoothing=0.0, from_logits=False)
+                       if FOCAL else
+                       CategoricalCrossentropy(from_logits=False))
+        else:
+            loss_fn = (BinaryFocalCrossentropy(alpha=0.75, gamma=1.5)
+                       if FOCAL else
+                       BinaryCrossentropy(from_logits=False))
+        optimizer = tf.keras.optimizers.AdamW(
+            learning_rate=lr_schedule,
+            weight_decay=1e-3,
+            use_ema=True,
+            ema_momentum=0.999,
+            ema_overwrite_frequency=None
         )
 
-    n_timepoints = int(WINDOW_SEC * FS_TARGET)
-    train_ds, val_ds = make_datasets(TFRECORD_DIR, n_channels, n_timepoints)
+        # Build model inside strategy scope
+        match MODEL:
+                case 'HYB':
+                    model = build_hybrid(
+                        input_shape=(n_timepoints, eff_channels),
+                        num_classes=NUM_CLASSES,
+                        one_hot=ONEHOT,
+                        time_step=TIME_STEP,
+                        feat_input_dim=feat_input_dim,
+                    )
+                case 'TRANS':
+                    model = build_transformer(
+                        input_shape=(n_timepoints, eff_channels),
+                        num_classes=NUM_CLASSES,
+                        time_step_classification=TIME_STEP,
+                        one_hot=ONEHOT,
+                        hpc=HPC,
+                        use_se=USE_SE,
+                        feat_input_dim=feat_input_dim,
+                    )
+                case _:
+                    model = build_tcn(
+                        input_shape=(n_timepoints, eff_channels),
+                        num_classes=NUM_CLASSES,
+                        kernel_size=TCN_KERNEL_SIZE,
+                        num_blocks=TCN_BLOCKS,
+                        time_step_classification=TIME_STEP,
+                        one_hot=ONEHOT,
+                        hpc=HPC,
+                        separable=True,
+                        feat_input_dim=feat_input_dim,
+                    )
 
-    # Canales efectivos del modelo
-    if (not TIME_STEP) and (WINDOW_MODE == "features"):
-        n_channels_eff = n_channels + WINDOW_FEATURES_DIM
+        # Print receptive field info for TCN-like models
+        if MODEL == 'TCN':
+            t_steps = n_timepoints
+            fs = PREPROCESS['resample']
+            print_receptive_field_tcn(t_steps, fs, TCN_KERNEL_SIZE, TCN_BLOCKS, run_dir=RUN_DIR)
+
+        # Metrics: simpler set for binary (ONEHOT=False), richer for one-hot multiclass
+        if not ONEHOT:
+            metrics = [
+                tf.keras.metrics.BinaryAccuracy(name='accuracy'),
+                AUCClass(class_index=1, curve="PR",  name="pr_auc"),
+                AUCClass(class_index=1, curve="ROC", name="roc_auc"),
+                PrecisionClass(1, name="precision"),
+                RecallClass(1,    name="recall"),
+                F1Class(1,        name="f1"),
+                # positive-class confusion-matrix counters
+                TruePositivesClass(1, name="tp"),
+                TrueNegativesClass(1, name="tn"),
+                FalsePositivesClass(1, name="fp"),
+                FalseNegativesClass(1, name="fn"),
+                PrecisionAtRecallClass(1, recall=0.90, name="precision_at_recall90"),
+                RecallAtPrecisionClass(1, precision=0.90, name="recall_at_precision90"),
+                SensitivityAtSpecificityClass(1, specificity=0.995, name="sens_at_spec99p5"),
+                SpecificityAtSensitivityClass(1, sensitivity=0.90, name="spec_at_sens90"),
+                BrierPos(class_index=1, name="brier_pos_seizure"),
+                BalancedAccuracy(class_index=1, name="balanced_accuracy"),
+            ]
+        else:
+            metrics = [
+                tf.keras.metrics.CategoricalAccuracy(name='accuracy'),
+                AUCClass(class_index=1, curve="PR",  name="pr_auc_seizure"),
+                AUCClass(class_index=1, curve="ROC", name="roc_auc_seizure"),
+                AUCClass(class_index=0, curve="PR",  name="pr_auc_background"),
+                AUCClass(class_index=0, curve="ROC", name="roc_auc_background"),
+                PrecisionClass(1, name="precision_seizure"),
+                RecallClass(1,    name="recall_seizure"),
+                PrecisionClass(0, name="precision_background"),
+                RecallClass(0,    name="recall_background"),
+                F1Class(1, name="f1_seizure"),
+                F1Class(0, name="f1_background"),
+                PrecisionAtRecallClass(1, recall=0.90, name="precision_at_recall90_c1_s"),
+                RecallAtPrecisionClass(1, precision=0.90, name="recall_at_precision90_c1_s"),
+                SensitivityAtSpecificityClass(1, specificity=0.995, name="sens_at_spec99p5_c1_s"),
+                SpecificityAtSensitivityClass(1, sensitivity=0.90, name="spec_at_sens90_c1_s"),
+                PrecisionAtRecallClass(0, recall=0.90, name="precision_at_recall90_c1_b"),
+                RecallAtPrecisionClass(0, precision=0.90, name="recall_at_precision90_c1_b"),
+                SensitivityAtSpecificityClass(0, specificity=0.995, name="sens_at_spec99p5_c1_b"),
+                SpecificityAtSensitivityClass(0, sensitivity=0.90, name="spec_at_sens90_c1_b"),
+                TruePositivesClass(1, name="tp_seizure"),
+                TrueNegativesClass(1, name="tn_seizure"),
+                FalsePositivesClass(1, name="fp_seizure"),
+                FalseNegativesClass(1, name="fn_seizure"),
+                TruePositivesClass(0, name="tp_background"),
+                TrueNegativesClass(0, name="tn_background"),
+                FalsePositivesClass(0, name="fp_background"),
+                FalseNegativesClass(0, name="fn_background"),
+                BrierPos(class_index=1, name="brier_pos_seizure"),
+                BalancedAccuracy(class_index=1, name="balanced_accuracy"),
+            ]
+        model.compile(
+                optimizer=optimizer,
+                loss=loss_fn,
+                metrics=metrics,
+                jit_compile=True
+            )
+
+    # Save model summary after build
+    save_model_summary(model, RUN_DIR)
+
+    # Pareto/selector: in binary mode, monitor a single primary metric; in one-hot, keep dual metrics
+    if not ONEHOT:
+        pareto_primary = ParetoCheckpointMulti(
+                filepath=str(RUN_DIR / "pareto_primary_ep{epoch:03d}.keras"),
+                metrics=["val_pr_auc"],
+                directions=["max"],
+                eps=[1e-4],
+                constraints=[],
+                save_weights_only=False, verbose=1
+            )
     else:
-        n_channels_eff = n_channels
+        pareto_primary = ParetoCheckpointMulti(
+                filepath=str(RUN_DIR / "pareto_both_recalls_ep{epoch:03d}.keras"),
+                metrics=["val_recall_seizure", "val_recall_background"],
+                directions=["max", "max"],
+                eps=[1e-4, 1e-4],
+                constraints=[],
+                save_weights_only=False, verbose=1
+            )
 
-    # Sanidad rápida
-    inspect_dataset(train_ds, batches=10)
-    inspect_dataset(val_ds,   batches=10)
+    if not ONEHOT:
+        pareto_auc = ParetoCheckpointMulti(
+                filepath=str(RUN_DIR / "pareto_auc_ep{epoch:03d}.keras"),
+                metrics=["val_pr_auc"],
+                directions=["max"],
+                eps=[1e-4],
+                save_weights_only=False, verbose=1
+            )
+    else:
+        pareto_auc = ParetoCheckpointMulti(
+                filepath=str(RUN_DIR / "pareto_auc_both_ep{epoch:03d}.keras"),
+                metrics=["val_pr_auc_seizure", "val_pr_auc_background"],
+                directions=["max", "max"],
+                eps=[1e-4, 1e-4],
+                save_weights_only=False, verbose=1
+            )
 
-    # Dataset infinito + pasos explícitos (robusto)
-    # Creamos datasets "contables" sin shuffle para cardinalidad
-    count_train_ds = create_dataset_final(
-        glob.glob(os.path.join(TFRECORD_DIR, 'train', '*.tfrecord')) or [os.path.join(TFRECORD_DIR, 'train.tfrecord')],
-        n_channels=n_channels, n_timepoints=n_timepoints,
-        batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
-        shuffle=False, balance_pos_frac=None, drop_remainder=True,
-    )
-    count_val_ds = create_dataset_final(
-        glob.glob(os.path.join(TFRECORD_DIR, 'val', '*.tfrecord')) or [os.path.join(TFRECORD_DIR, 'val.tfrecord')],
-        n_channels=n_channels, n_timepoints=n_timepoints,
-        batch_size=BATCH_SIZE, time_step=TIME_STEP, one_hot=ONEHOT,
-        shuffle=False, balance_pos_frac=None, drop_remainder=True,
-    )
-    steps_per_epoch  = cardinality_safe(count_train_ds)
-    val_steps        = cardinality_safe(count_val_ds)
+    if not ONEHOT:
+        pareto_f1 = ParetoCheckpointMulti(
+                filepath=str(RUN_DIR / "pareto_f1_ep{epoch:03d}.keras"),
+                metrics=["val_f1"],
+                directions=["max"],
+                eps=[1e-4],
+                save_weights_only=False, verbose=1
+            )
+    else:
+        pareto_f1 = ParetoCheckpointMulti(
+                filepath=str(RUN_DIR / "pareto_f1_both_ep{epoch:03d}.keras"),
+                metrics=["val_f1_seizure", "val_f1_background"],
+                directions=["max", "max"],
+                eps=[1e-4, 1e-4],
+                save_weights_only=False, verbose=1
+            )
 
-    train_ds = train_ds.repeat()
-    val_ds   = val_ds.repeat()
+    best_by_brier = tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(RUN_DIR / "best_by_brier.keras"),
+            monitor="val_brier_pos_seizure", # nombre correcto de la métrica
+            mode="min",
+            save_best_only=True,
+            verbose=1
+        )
 
-    # LR schedule
-    total_steps = max(1, EPOCHS * steps_per_epoch)
-    lr_sched = WarmupCosineSchedule(
-        base_lr=LEARNING_RATE, total_steps=total_steps,
-        warmup_ratio=WARMUP_RATIO, min_lr_frac=MIN_LR_FRAC
-    )
+    best_by_frame_recall_ckpt = tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(RUN_DIR / ("best_by_recall.keras" if not ONEHOT else "best_by_seizure_recall.keras")),
+            monitor=("val_recall" if not ONEHOT else "val_recall_seizure"),
+            mode="max",
+            save_best_only=True,
+            verbose=1
+        )
 
-    # Optimizer AdamW
-    try:
-        optimizer = tf.keras.optimizers.AdamW(learning_rate=lr_sched, weight_decay=WEIGHT_DECAY, use_ema=False)
-    except TypeError:
-        optimizer = tf.keras.optimizers.AdamW(learning_rate=lr_sched, weight_decay=WEIGHT_DECAY)
+        # # keep this only if you compiled with tf.keras.metrics.AUC(curve="PR", name="pr_auc")
+        # best_by_pr_auc_ckpt = tf.keras.callbacks.ModelCheckpoint(
+        #     filepath=str(RUN_DIR / "best_by_pr_auc.keras"),
+        #     monitor="val_pr_auc",         # from model.evaluate on validation_data
+        #     mode="max",
+        #     save_best_only=True,
+        #     verbose=1
+        # )
 
-    
-    # Modelo
-    num_classes = 2 if ONEHOT else 1
-    model = build_tcn(
-        input_shape=(n_timepoints, n_channels_eff),
-        num_classes=num_classes,
-        one_hot=ONEHOT, time_step=TIME_STEP,
-        separable=True, use_squeeze_excitation=True, use_gelu=True
-    )
+    # per-epoch weights for forensic/ablations (doesn't select, just saves) – avoid formatting with unknown metrics
+    per_epoch_weights = tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(RUN_DIR / "weights" / "ep{epoch:03d}.weights.h5"),
+            save_weights_only=True,
+            save_best_only=False,
+            monitor=("val_recall" if not ONEHOT else "val_recall_seizure"),
+            mode="max",
+            save_freq="epoch",
+            verbose=0
+        )
 
-    model = JITModel(inputs=model.inputs, outputs=model.outputs, name=model.name)
+        # --- Early Stopping (choose ONE primary criterion) ---
+        # Option B: stop by frame recall (if you still prefer frame-level behavior)
+    earlystop_frame = tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            mode="min",
+            patience=15,
+            min_delta=1e-4,
+            restore_best_weights=True,
+            verbose=1
+        )
 
-    # Métricas y pérdida
-    metrics = make_metrics(ONEHOT)
-    loss_fn = make_loss(ONEHOT)
+        # --- Housekeeping / instrumentation ---
+    backup_cb = tf.keras.callbacks.BackupAndRestore(
+            backup_dir=str(RUN_DIR / "bak"),
+            save_freq="epoch",
+        )
+    tensorboard_cb = tf.keras.callbacks.TensorBoard(
+            log_dir=str(RUN_DIR / "tb_train"),
+            histogram_freq=0,
+            write_graph=False,
+            write_images=False,
+            update_freq="epoch",
+        )
+    # define time tracker BEFORE CSV logger that references it
+    time_cb = TimeHistory()
+    cb_csvlogger = CSVLoggerWithEpochTime(str(RUN_DIR / "training_log.csv"), time_cb)
+    # optional: a minimal CSV just for epoch_time if the main CSV has issues
+    class EpochTimeCSV(tf.keras.callbacks.Callback):
+        def __init__(self, path, time_cb):
+            super().__init__()
+            self.path = Path(path)
+            self.time_cb = time_cb
+            self._wrote_header = False
+        def on_epoch_end(self, epoch, logs=None):
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.path, 'a') as f:
+                if not self._wrote_header:
+                    f.write('epoch,epoch_time\n')
+                    self._wrote_header = True
+                et = (self.time_cb.epoch_times[epoch] if self.time_cb and len(self.time_cb.epoch_times) > epoch else '')
+                f.write(f"{epoch},{et}\n")
+    cb_epoch_time_fallback = EpochTimeCSV(RUN_DIR / 'training_epoch_times.csv', time_cb)
+    terminate_nan_cb = tf.keras.callbacks.TerminateOnNaN()
+    cb_timelimit = TimeLimitCallback(max_seconds=TIME_LIMIT_H*3600)
+    lr_logger = LRLogger(RUN_DIR, every_steps=20)
+        # pr_logger = PRCurveLogger(val_ds, RUN_DIR, max_batches=800)  # frame-PR diagnostic
+    ema_swap = SwapEMAWeights(swap_on_epoch=True)
 
-    model.compile(
-        optimizer=optimizer,
-        loss=loss_fn,
-        metrics=metrics,
-        # jit_compile=True,
-        run_eagerly=False,
-        steps_per_execution=1,
-    )
+        # --- FINAL ORDER: things that MODIFY logs (calibrator) must come BEFORE ckpts/earlystop ---
+    all_cbs = [
+            # 1) metric writers / modifiers (populate logs first)
+            ema_swap,           # if it swaps weights for evaluation, keep it before val/eop logging
+            # pr_calibrator,      # <-- injects val_event_recall, val_fa_per_24h, etc. into logs
 
-    # Monitores secundarios automáticos si no se definieron explícitamente
-    sec_mons = list(SECONDARY_MONITORS)
-    if not sec_mons:
-        for s in SENS_AT_SPEC_TARGETS:
-            sec_mons.append(f"val_{_mn_sens_at_spec(s)}")
-        for s in SPEC_AT_SENS_TARGETS:
-            sec_mons.append(f"val_{_mn_spec_at_sens(s)}")
-        for t in THRESHOLDS[:1]:
-            sec_mons.extend([
-                f"val_{_mn_recall_t(t)}",
-                f"val_{_mn_spec_t(t)}",
-                f"val_{_mn_tp_t(t)}",
-                f"val_{_mn_tn_t(t)}",
-                f"val_{_mn_fp_t(t)}",
-                f"val_{_mn_fn_t(t)}",
-            ])
+            # 2) selectors (consume logs to save/stop)
+            # best_by_event_ckpt,         # uses val_event_recall
+            best_by_frame_recall_ckpt,  # uses val_recall_seizure (optional)
+            pareto_primary,
+            best_by_brier,
+            pareto_f1,
+            pareto_auc,
+            per_epoch_weights,
+            # Choose ONE early stop:
+            # earlystop_event,            # preferred
+            earlystop_frame,          # (disable if using earlystop_event)
 
-    callbacks = make_callbacks(
-        RUN_DIR,
-        primary_monitor=PRIMARY_MONITOR if PRIMARY_MONITOR.startswith("val_") else f"val_{PRIMARY_MONITOR}",
-        secondary_monitors=sec_mons
-    )
+            # 3) infra/logging
+            backup_cb,
+            tensorboard_cb,
+            cb_csvlogger,
+            lr_logger,#pr_logger,
+            terminate_nan_cb,
+            cb_timelimit,
+            time_cb,
+            cb_epoch_time_fallback,
+        ]
+        # train_ds = train_ds.take(steps_per_epoch)
+    history = model.fit(
+            train_ds, 
+            validation_data=val_ds, 
+            epochs=EPOCHS,
+            steps_per_epoch=steps_per_epoch,
+            callbacks=all_cbs + [TqdmCallback(verbose=1)],              
+            verbose=2
+        )
+    model.save('comp_model.keras')
+    print("Model saved to final_model.keras")
+    return model, history
+        
+# =================================================================================================================
+# Main execution    
+# ================================================================================================================    
 
-    # ETA ligero (imprime cada 20 s una línea dentro de la época)
-    eta_cb = LightETA(train_steps=steps_per_epoch, print_every_sec=20, track=("loss","accuracy"))
-
-    print(f"🚀 Entrenando — modo: {'ONEHOT' if ONEHOT else 'BINARIO'} | TIME_STEP={TIME_STEP}")
-    report_cb = ThresholdReportCSV(RUN_DIR, thresholds=THRESHOLDS, filename="reports/threshold_report.csv")
-    hist = model.fit(
-        train_ds, validation_data=val_ds,
-        steps_per_epoch=steps_per_epoch, validation_steps=val_steps,
-        epochs=EPOCHS,
-        callbacks=callbacks + [eta_cb, report_cb],
-        verbose=2
-    )
-
-    # Guardados finales (portables)
-    final_base = RUN_DIR / "final_model"
-    model.save(str(final_base) + ".keras", include_optimizer=False)  # arquitectura + pesos
-    model.save_weights(str(final_base) + ".weights.h5")              # solo pesos
-    print(f"✅ Guardado: {final_base}.keras  y  {final_base}.weights.h5")
-    return model, hist
-
-# ================================ MAIN =======================================
 if __name__ == "__main__":
+    # Example usage
     data_root = '../DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3'
-    pipeline(data_root=data_root, n_channels=22)
+    tn_timepoints = int(WINDOW_SEC * PREPROCESS['resample'])
+    print(tn_timepoints)
+    model, history = pipeline(data_root, n_timepoints=tn_timepoints, n_channels=22, write_ds=WRITE, limits=LIMITS)
+    print("Pipeline completed successfully.")
