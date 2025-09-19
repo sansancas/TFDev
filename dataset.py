@@ -34,6 +34,10 @@ ALL_EEG_FEATURES = [
     "bp_rel_delta", "bp_rel_theta", "bp_rel_alpha", "bp_rel_beta", "bp_rel_gamma",
     # Extras espectrales
     "spectral_entropy", "sef95", "beta_alpha_ratio", "theta_alpha_ratio",
+    # Nuevos ratios derivados
+    "ratio_theta_alpha", "ratio_beta_alpha", "ratio_theta_alpha_over_beta", "ratio_theta_beta", "ratio_theta_alpha_over_alpha_beta",
+    # Nueva estadística temporal
+    "std_eeg",
     # También disponibles (no incluidas en default): absolutos
     "bp_delta", "bp_theta", "bp_alpha", "bp_beta", "bp_gamma",
 ]
@@ -526,16 +530,29 @@ def create_dataset_final_v2(
     sample_rate=None,           # Hz. Requerido para band-powers
     feature_names=None,         # lista de strings desde ALL_EEG_FEATURES; si None usa DEFAULT_EEG_FEATURES
     return_feature_vector=False, # NUEVO: si True en modo 'features' devuelve (eeg, feats) sin replicar
-    prefetch: bool = True        # NUEVO: permite desactivar el prefetch interno para colocar repeat antes del prefetch final
+    prefetch: bool = True,       # NUEVO: permite desactivar el prefetch interno para colocar repeat antes del prefetch final
+    balance_strategy: str = 'none',  # 'rejection' | 'undersample' | 'none'
 ):
+    """Crea dataset final (X,y) con soporte de:
+    - Modos de ventana: default | soft | features | soft+features
+    - time_step: clasificación frame-level
+    - one_hot: etiquetas one-hot
+    - return_feature_vector: ( (T,C), feats_vector ) en modo features (no concatena sobre tiempo)
+    - balanceo interno ('rejection' o 'undersample') antes de batch.
+
+    Balanceo:
+      balance_pos_frac + balance_strategy
+        'rejection'   -> rejection_resample (aceptación/rechazo) mantiene variedad sin duplicar explícito.
+        'undersample' -> sample_from_datasets sobre divisiones pos/neg (descarta parte de negativos).
+        'none'        -> ignora balance_pos_frac.
+    Para time_step se decide la etiqueta de la ventana como (any frame >=0.5) para fines de balanceo.
+    Compatible con window_mode soft/features y one_hot.
     """
-    Devuelve dataset (X, y). En modo ventana+features, X = (T, C + F_select) con features SOLO-EEG.
-    No se añaden features derivadas de labels (evita leakage). y es la etiqueta de la ventana (dura o suave, con/ sin one-hot).
-    """
+
     if sample_rate is None:
         raise ValueError("create_dataset_final_v2 requiere sample_rate para computar features espectrales.")
 
-    # Actualizar nombres globales para inspección
+    # Selección de features
     selected_features = list(feature_names) if feature_names is not None else list(DEFAULT_EEG_FEATURES)
     global FEATURE_NAMES_BASE, FEATURE_NAMES_WITH_LABELS
     FEATURE_NAMES_BASE = selected_features
@@ -686,6 +703,8 @@ def create_dataset_final_v2(
         # Temporales básicos
         feats_dict['rms_eeg'] = tf.sqrt(tf.reduce_mean(tf.square(x)))
         feats_dict['mad_eeg'] = tf.reduce_mean(tf.abs(x - tf.reduce_mean(x)))
+        # Std temporal promedio por canal
+        feats_dict['std_eeg'] = tf.reduce_mean(tf.math.reduce_std(x, axis=0))
         feats_dict['line_length'] = tf.cond(tf.shape(x)[0] >= 2, lambda: _line_length(x), lambda: tf.constant(0.0, tf.float32))
         feats_dict['zcr'] = tf.cond(tf.shape(x)[0] >= 2, lambda: _zcr(x), lambda: tf.constant(0.0, tf.float32))
         feats_dict['tkeo_mean'] = tf.cond(tf.shape(x)[0] >= 3, lambda: _tkeo(x), lambda: tf.constant(0.0, tf.float32))
@@ -699,8 +718,16 @@ def create_dataset_final_v2(
         feats_dict.update(spec)
         # Ratios
         eps = tf.constant(1e-8, tf.float32)
+        # Ratios legacy (mantener si otros scripts los referencian)
         feats_dict['beta_alpha_ratio'] = spec['bp_beta'] / (spec['bp_alpha'] + eps)
         feats_dict['theta_alpha_ratio'] = spec['bp_theta'] / (spec['bp_alpha'] + eps)
+        # Nuevos ratios solicitados
+        Tt = spec['bp_theta']; Aa = spec['bp_alpha']; Bb = spec['bp_beta']
+        feats_dict['ratio_theta_alpha'] = Tt / (Aa + eps)
+        feats_dict['ratio_beta_alpha'] = Bb / (Aa + eps)
+        feats_dict['ratio_theta_alpha_over_beta'] = (Tt + Aa) / (Bb + eps)
+        feats_dict['ratio_theta_beta'] = Tt / (Bb + eps)
+        feats_dict['ratio_theta_alpha_over_alpha_beta'] = (Tt + Aa) / (Aa + Bb + eps)
         # Ensamblar en el orden solicitado (garantiza orden estable)
         vals = [feats_dict[name] for name in names]
         feats_raw = tf.stack(vals, axis=0)
@@ -783,15 +810,90 @@ def create_dataset_final_v2(
         return eeg, y
 
     ds = tf.data.TFRecordDataset(tfrecord_files, num_parallel_reads=tf.data.AUTOTUNE)
-    if shuffle:
-        ds = ds.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
     ds = ds.map(_parse, num_parallel_calls=tf.data.AUTOTUNE)
+
     if cache:
         ds = ds.cache()
-    if balance_pos_frac is not None:
-        pass
+    if shuffle:
+        ds = ds.shuffle(shuffle_buffer, reshuffle_each_iteration=True)
+
+    # ---- Balanceo (antes de batch) ----
+    if balance_pos_frac is not None and balance_strategy != 'none':
+        target_p = float(balance_pos_frac)
+        target_p = min(max(target_p, 1e-6), 1 - 1e-6)
+
+        def _is_positive_example(x, y):
+            # Si se devolvió (eeg, feats) como entrada, x puede ser tupla
+            if isinstance(x, (tuple, list)):
+                # asumimos (eeg, feats)
+                eeg_part = x[0]
+                # feats no usadas para decisión
+            # decisiones basadas sólo en y
+            if one_hot:
+                yy = y[..., 1]
+            else:
+                if y.shape.rank is not None and y.shape.rank > 0 and y.shape[-1] == 1:
+                    yy = tf.squeeze(y, axis=-1)
+                else:
+                    yy = y
+            yy = tf.cast(yy, tf.float32)
+            if time_step:
+                return tf.reduce_any(yy >= 0.5)
+            if yy.shape.rank == 0:
+                return yy >= 0.5
+            if yy.shape.rank == 1 and tf.shape(yy)[0] > 1:  # soft vector improbable aquí (one_hot soft)
+                return tf.reduce_mean(yy) >= 0.5
+            return yy >= 0.5
+
+        if balance_strategy == 'rejection':
+            try:
+                from tensorflow.data.experimental import rejection_resample
+            except Exception:
+                rejection_resample = None
+            if rejection_resample is not None:
+                def class_func(x, y):
+                    return tf.cast(_is_positive_example(x, y), tf.int64)
+                def estimate_initial(sample_ds, max_samples=3000):
+                    pos = 0
+                    tot = 0
+                    for ex_x, ex_y in sample_ds.take(max_samples):
+                        if bool(_is_positive_example(ex_x, ex_y).numpy()):
+                            pos += 1
+                        tot += 1
+                    if tot == 0:
+                        return [0.5, 0.5]
+                    p = pos / tot
+                    p = min(max(p, 1e-6), 1-1e-6)
+                    return [1.0 - p, p]
+                try:
+                    initial_dist = estimate_initial(ds)
+                except Exception:
+                    initial_dist = [0.9, 0.1]
+                target_dist = [1.0 - target_p, target_p]
+                ds = ds.apply(rejection_resample(class_func=class_func,
+                                                 target_dist=target_dist,
+                                                 initial_dist=initial_dist,
+                                                 seed=42))
+                ds = ds.map(lambda lbl, pair: pair, num_parallel_calls=tf.data.AUTOTUNE)
+            else:
+                # Fallback: usar undersample si no está disponible
+                balance_strategy = 'undersample'
+
+        if balance_strategy == 'undersample':
+            def filter_pos(x, y):
+                return _is_positive_example(x, y)
+            def filter_neg(x, y):
+                return tf.logical_not(_is_positive_example(x, y))
+            ds_pos = ds.filter(filter_pos)
+            ds_neg = ds.filter(filter_neg)
+            ds = tf.data.Dataset.sample_from_datasets(
+                [ds_pos, ds_neg],
+                weights=[target_p, 1.0 - target_p],
+                seed=42,
+                stop_on_empty_dataset=False
+            )
+
     ds = ds.batch(batch_size, drop_remainder=drop_remainder)
-    # Prefetch sólo si se solicita; para entrenamiento se recomienda: build -> batch -> repeat -> prefetch (externo)
     if prefetch:
         ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds

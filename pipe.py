@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from datetime import datetime
 import logging
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import tensorflow as tf
@@ -17,12 +17,13 @@ from tensorflow.keras import backend as K
 import absl.logging as absl
 from tqdm.keras import TqdmCallback
 from dataset import create_dataset_final_v2, write_tfrecord_splits_FINAL_CORRECTED, DEFAULT_EEG_FEATURES
-
-tf.config.optimizer.set_jit(True)
+JIT = True
+tf.config.optimizer.set_jit(JIT)
 from tensorflow.keras.callbacks import Callback, CSVLogger, TerminateOnNaN, SwapEMAWeights, TensorBoard, BackupAndRestore
 from models.TCN import build_tcn
 from models.Hybrid import build_hybrid
 from models.Transformer import build_transformer
+from dataset import make_balanced_stream
 # from tensorflow_addons.callbacks import TQDMProgressBar
 
 USE_GRU = True
@@ -33,16 +34,16 @@ PREPROCESS = {
     'resample': 256,          # Hz target
 }
 WINDOW_SEC = 5.0             # Window length in seconds
-BATCH_SIZE = 48
+BATCH_SIZE = 12
 EPOCHS = 100
 USE_DROPOUT = True
-DROPOUT_RATE = 0.2
+DROPOUT_RATE = 0.3
 LEARNING_RATE = 2e-4
 MIN_LR_FRACTION = 0.05
 MIN_LR = LEARNING_RATE * MIN_LR_FRACTION
 WARMUP_RATIO = 0.1
 LIMITS={'train': 750, 'dev': 150, 'eval': 150}
-TIME_LIMIT_H = 24
+TIME_LIMIT_H = 48
 FRAME_HOP_SEC = 2.5
 SWEEP=False
 HPC = False
@@ -62,9 +63,11 @@ RUNS_DIR = Path("./runs")
 RUN_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 RUN_DIR = RUNS_DIR / f"eeg_seizures_{RUN_STAMP}"
 
-MODEL = 'HYB'  
+MODEL = 'TRANS'  
 # Use focal losses if True; otherwise standard cross-entropy losses
 FOCAL = True
+CLASS_WEIGHTS = False
+BALANCED_STREAM = 0.2
 # Dataset window mode configuration:
 # - "default": hard window label
 # - "soft": soft label = frac of positive frames
@@ -75,19 +78,21 @@ WINDOW_MODE = "features"
 
 # FEATURE_NAMES = list(DEFAULT_EEG_FEATURES)  # all
 
-
 FEATURE_NAMES = [
-    "rms_eeg",
-    "line_length",
-    "hjorth_activity",
-    "hjorth_mobility",
-    "hjorth_complexity",
-    "bp_rel_theta",
-    "bp_rel_alpha",
-    "bp_rel_beta",
-    "spectral_entropy",
-    "sef95",
+    "rms_eeg",              # energía global (mantén solo uno de rms/std/mad/activity)
+    "line_length",          # complejidad y contenido HF
+    "hjorth_mobility",      # dinámica de primer orden
+    "hjorth_complexity",    # irregularidad (2º orden / 1º orden)
+    "bp_rel_theta",         # composición espectral lenta
+    "bp_rel_alpha",         # ritmo de reposo / cambios de activación
+    "bp_rel_beta",          # activación / rápida
+    "ratio_theta_beta",     # equilibrio lentitud vs rápida (un único ratio discriminativo)
+    "spectral_entropy",     # organización vs aleatoriedad
+    "sef95",                # desplazamiento espectral global
+    "tkeo_mean",            # energía instantánea / bursts
+    "zcr",                  # cruces por cero (HF / fragmentación)
 ]
+
 # If True and WINDOW_MODE=="features" and TIME_STEP==False, the dataset will return (eeg, feats) separately
 # and models will use a dual-input path for better efficiency.
 FEATURES_AS_VECTOR = True
@@ -101,6 +106,8 @@ def save_run_config(run_dir: Path, extra: dict | None = None):
     cfg = {
         "MODEL": MODEL,
         "FOCAL": FOCAL,
+        "CLASS_WEIGHTS": CLASS_WEIGHTS,
+        "BALANCED_STREAM": BALANCED_STREAM,
         "PREPROCESS": PREPROCESS,
         "WINDOW_SEC": WINDOW_SEC,
         "FRAME_HOP_SEC": FRAME_HOP_SEC,
@@ -120,8 +127,8 @@ def save_run_config(run_dir: Path, extra: dict | None = None):
         "WINDOW_MODE": WINDOW_MODE,
         "FEATURE_NAMES": FEATURE_NAMES,
         "FEATURES_AS_VECTOR": FEATURES_AS_VECTOR,
-    "TCN_KERNEL_SIZE": TCN_KERNEL_SIZE,
-    "TCN_BLOCKS": TCN_BLOCKS,
+        "TCN_KERNEL_SIZE": TCN_KERNEL_SIZE,
+        "TCN_BLOCKS": TCN_BLOCKS,
         "CUT": CUT,
         "TFRECORD_DIR": str(TFRECORD_DIR),
         "RUN_DIR": str(run_dir),
@@ -646,6 +653,35 @@ def focal_loss(gamma=2.0, alpha=0.25):
 # Pipeline Functions
 # =================================================================================================================
 
+def estimate_class_weight(ds: tf.data.Dataset, onehot: bool, time_step: bool, max_batches: int = 100) -> Optional[Dict[int, float]]:
+    """Approximate class weights from a dataset batch stream (window-level recommended).
+    Returns {0: w0, 1: w1} so that expected weight ~ 1. If time_step=True, returns None.
+    """
+    if time_step:
+        # Using class_weight with per-timestep labels is not directly supported
+        return None
+    pos = 0
+    neg = 0
+    count_batches = 0
+    for x, y in ds.take(max_batches):  # type: ignore
+        yb = y.numpy()
+        # shapes: (B,1) or (B,2) or (B,)
+        if onehot:
+            if yb.ndim >= 2:
+                yb = yb[..., -1]
+        yb = yb.reshape(-1)
+        pos += int((yb > 0.5).sum())
+        neg += int((yb <= 0.5).sum())
+        count_batches += 1
+    total = pos + neg
+    if total == 0:
+        return None
+    p = pos / float(total)
+    p = min(max(p, 1e-6), 1 - 1e-6)
+    # weights so that E[w] = 1: w1*p + w0*(1-p) = 1, with w1 = 0.5/p, w0 = 0.5/(1-p)
+    w1 = 0.5 / p
+    w0 = 0.5 / (1.0 - p)
+    return {0: float(w0), 1: float(w1)}
 
 def inspect_dataset(ds: tf.data.Dataset, num_batches: int | None = 3, positive_label: int = 1):
     """Ligero y compatible con todos los modos (time-step/window, one-hot/binario, soft):
@@ -720,13 +756,17 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
             one_hot=ONEHOT,
             time_step=TIME_STEP,
             shuffle=True,
-            balance_pos_frac=None,
+            balance_pos_frac=(BALANCED_STREAM if BALANCED_STREAM and BALANCED_STREAM > 0 else None),
+            balance_strategy='rejection',  # o 'undersample' configurable
             sample_rate=PREPROCESS['resample'],
             window_mode=WINDOW_MODE,
             feature_names=FEATURE_NAMES,
-            return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP)
+            return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP),
+            cache=False,
+            prefetch=True
         )
     def _make_count_ds(paths):
+        # Para estimar steps y class weights no aplicamos balance
         return create_dataset_final_v2(
             paths,
             n_channels=n_channels,
@@ -736,10 +776,13 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
             time_step=TIME_STEP,
             shuffle=False,
             balance_pos_frac=None,
+            balance_strategy='rejection',  # o 'undersample' configurable
             sample_rate=PREPROCESS['resample'],
             window_mode=WINDOW_MODE,
             feature_names=FEATURE_NAMES,
-            return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP)
+            return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP),
+            cache=False,
+            prefetch=True
         )
     # Count steps safely (cardinality may be UNKNOWN due to flat_map)
     _count_ds = _make_count_ds(train_paths)
@@ -765,6 +808,9 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
         warmup_steps=warmup_steps
     )
 
+    if BALANCED_STREAM is not None and BALANCED_STREAM > 0.0:
+        print(f"Internal balancing active (strategy=rejection) target pos frac {BALANCED_STREAM}")
+
     val_ds = create_dataset_final_v2(
         val_paths,
         n_channels=n_channels,
@@ -776,9 +822,11 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
         balance_pos_frac=None,
         sample_rate=PREPROCESS['resample'],
         window_mode=WINDOW_MODE,
-    feature_names=FEATURE_NAMES,
-    return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP)
-     )
+        feature_names=FEATURE_NAMES,
+        return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP),
+        cache=False,
+        prefetch=True
+    )
 
     inspect_dataset(_count_ds, num_batches=10000)
     inspect_dataset(val_ds, num_batches=10000)
@@ -791,6 +839,13 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
         # concatenated to channels per time step
         eff_channels = n_channels + len(FEATURE_NAMES)
 
+    if CLASS_WEIGHTS:
+        class_weight = estimate_class_weight(_count_ds, onehot=ONEHOT, time_step=TIME_STEP, max_batches=100)
+        if class_weight is not None:
+            print("Using estimated class weights:", class_weight)
+        else:
+            print("Could not estimate class weights, proceeding without them.")
+
     strategy = tf.distribute.OneDeviceStrategy("GPU:0")
     with strategy.scope():
         # Loss selection respects FOCAL flag
@@ -799,7 +854,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                        if FOCAL else
                        CategoricalCrossentropy(from_logits=False))
         else:
-            loss_fn = (BinaryFocalCrossentropy(alpha=0.75, gamma=3)
+            loss_fn = (BinaryFocalCrossentropy(alpha=0.9, gamma=3)
                        if FOCAL else
                        BinaryCrossentropy(from_logits=False))
         optimizer = tf.keras.optimizers.AdamW(
@@ -819,7 +874,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                         one_hot=ONEHOT,
                         time_step=TIME_STEP,
                         feat_input_dim=feat_input_dim,
-                        kernel_size=TCN_KERNEL_SIZE,
+                        # kernel_size=TCN_KERNEL_SIZE,
                         num_filters=64,
                     )
                 case 'TRANS':
@@ -908,7 +963,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                 optimizer=optimizer,
                 loss=loss_fn,
                 metrics=metrics,
-                jit_compile=True
+                jit_compile=JIT
             )
 
     # Save model summary after build
@@ -1007,7 +1062,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
         # --- Early Stopping (choose ONE primary criterion) ---
         # Option B: stop by frame recall (if you still prefer frame-level behavior)
     earlystop_frame = tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss",
+            monitor="val_brier_pos_seizure",
             mode="min",
             patience=15,
             min_delta=1e-4,
@@ -1081,14 +1136,25 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
             cb_epoch_time_fallback,
         ]
         # train_ds = train_ds.take(steps_per_epoch)
-    history = model.fit(
-            train_ds, 
-            validation_data=val_ds, 
-            epochs=EPOCHS,
-            steps_per_epoch=steps_per_epoch,
-            callbacks=all_cbs + [TqdmCallback(verbose=1)],              
-            verbose=2
-        )
+    if CLASS_WEIGHTS:
+        history = model.fit(
+                train_ds, 
+                validation_data=val_ds, 
+                epochs=EPOCHS,
+                steps_per_epoch=steps_per_epoch,
+                callbacks=all_cbs + [TqdmCallback(verbose=1)],              
+                verbose=2,
+                class_weight=class_weight
+            )
+    else:
+        history = model.fit(
+                train_ds, 
+                validation_data=val_ds, 
+                epochs=EPOCHS,
+                steps_per_epoch=steps_per_epoch,
+                callbacks=all_cbs + [TqdmCallback(verbose=1)],              
+                verbose=2
+            )
     model.save('comp_model.keras')
     print("Model saved to final_model.keras")
     return model, history
