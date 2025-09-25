@@ -1,113 +1,184 @@
-from tensorflow.keras import layers, models
+from tensorflow.keras import layers, models, activations
+from keras import ops as K   # <- Keras 3 ops backend-agnostic
+import tensorflow as tf
+
+def gelu(x):
+    return activations.gelu(x) 
+
+def se_block_1d(x, se_ratio=16, name="se"):
+    ch = x.shape[-1]
+    s = layers.GlobalAveragePooling1D(name=f"{name}_sq")(x)
+    s = layers.Dense(max(1, ch // se_ratio), activation="relu", name=f"{name}_rd")(s)
+    s = layers.Dense(ch, activation="sigmoid", name=f"{name}_ex")(s)
+    s = layers.Reshape((1, ch), name=f"{name}_rs")(s)
+    return layers.Multiply(name=f"{name}_sc")([x, s])
+
+@tf.keras.utils.register_keras_serializable()
+class FiLM1D(layers.Layer):
+    def __init__(self, channels, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.channels = channels
+        self.dg = layers.Dense(channels, name=(name or "film")+"_g")
+        self.db = layers.Dense(channels, name=(name or "film")+"_b")
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "channels": self.channels,
+        })
+        return config
+    
+    def call(self, x, f):
+        # x: (B,T,C), f: (B,F)
+        g = self.dg(f)[:, tf.newaxis, :]
+        b = self.db(f)[:, tf.newaxis, :]
+        return g * x + b
+
+def causal_sepconv1d(x, filters, kernel_size, dilation_rate, name):
+    """Separable causal: pad left + valid."""
+    pad = (kernel_size - 1) * dilation_rate
+    x = layers.ZeroPadding1D(padding=(pad, 0), name=f"{name}_pad")(x)
+    x = layers.SeparableConv1D(filters=filters,
+                               kernel_size=kernel_size,
+                               dilation_rate=dilation_rate,
+                               padding="valid",
+                               depth_multiplier=1,
+                               use_bias=False,
+                               name=name)(x)
+    return x
+
+def gated_res_block(x, filters, kernel_size, dilation, separable, se_ratio, name):
+    """
+    Bloque residual 'gated' tipo WaveNet:
+    - (Conv tanh) ⊙ (Conv sigmoid) -> z
+    - Proyección 1x1 a filtros (residual) y a filtros (skip)
+    - SE opcional sobre la rama residual
+    Devuelve (x_residual, x_skip)
+    """
+    inp = x
+    # Conv(·) para filtro y puerta
+    if separable:
+        a = causal_sepconv1d(x, filters, kernel_size, dilation, name=f"{name}_a")
+        b = causal_sepconv1d(x, filters, kernel_size, dilation, name=f"{name}_b")
+    else:
+        a = layers.Conv1D(filters, kernel_size, dilation_rate=dilation,
+                          padding="causal", kernel_initializer="he_normal",
+                          name=f"{name}_a")(x)
+        b = layers.Conv1D(filters, kernel_size, dilation_rate=dilation,
+                          padding="causal", kernel_initializer="he_normal",
+                          name=f"{name}_b")(x)
+    a = layers.LayerNormalization(name=f"{name}_ln_a")(a)
+    b = layers.LayerNormalization(name=f"{name}_ln_b")(b)
+    z = activations.tanh(a) * activations.sigmoid(b)              # gating
+
+    # SE en la rama intermedia (opcional)
+    z = se_block_1d(z, se_ratio=se_ratio, name=f"{name}_se")
+
+    # proyecciones residual y skip
+    res = layers.Conv1D(filters, 1, padding="same", name=f"{name}_res")(z)
+    skip = layers.Conv1D(filters, 1, padding="same", name=f"{name}_skip")(z)
+
+    # alinear canales de la entrada si difiere
+    if inp.shape[-1] != filters:
+        inp = layers.Conv1D(filters, 1, padding="same", name=f"{name}_inproj")(inp)
+
+    out = layers.Add(name=f"{name}_add")([inp, res])  # residual
+    out = layers.SpatialDropout1D(0.1, name=f"{name}_drop")(out)
+    return out, skip
 
 def build_tcn(input_shape,
-              num_classes=2,
-              num_filters=68,
-              kernel_size=7,
-              dropout_rate=0.25,
-              num_blocks=7,
-              time_step_classification=True,
-              one_hot=True,
-              hpc=False,
-              separable=False,
-              feat_input_dim: int | None = None):
-    
-    # define the input layer
+                 num_classes=2,
+                 num_filters=64,
+                 kernel_size=7,
+                 dropout_rate=0.25,
+                 num_blocks=8,
+                 time_step_classification=True,
+                 one_hot=True,
+                 hpc=False,
+                 separable=False,
+                 se_ratio=16,
+                 cycle_dilations=(1,2,4,8),
+                 feat_input_dim: int | None = None,
+                 use_attention_pool_win=True):
+    """
+    Mejora sobre tu TCN:
+    - Bloques residuales 'gated' + skip global acumulado
+    - Causalidad estricta también en separables
+    - SE por bloque
+    - FiLM para fusionar features
+    - Cycling de dilataciones
+    - Attention pooling opcional en ventana
+    """
     dtype = 'float32' if hpc else None
-    inputs = layers.Input(shape=input_shape, dtype=dtype)
-    x = inputs
+    Inp = layers.Input(shape=input_shape, dtype=dtype, name="input")
+    x = Inp
 
-    # build TCN blocks
+    # FiLM temprano si hay features globales
+    feat_in = None
+    if feat_input_dim is not None and feat_input_dim > 0:
+        feat_in = layers.Input(shape=(feat_input_dim,), name="feat_input")
+        x = FiLM1D(channels=input_shape[-1], name="film_in")(x, feat_in)
+
+    skips = []
+    # pila de bloques
     for i in range(num_blocks):
-        dilation = 2 ** i
-        residual = x
+        dilation = cycle_dilations[i % len(cycle_dilations)]
+        x, s = gated_res_block(x, num_filters, kernel_size, dilation,
+                               separable, se_ratio, name=f"blk{i+1}")
+        skips.append(s)
 
-        # first causal conv + norm + dropout
-        if separable:
-            x = layers.SeparableConv1D(filters=num_filters,
-                                       kernel_size=kernel_size,
-                                       dilation_rate=dilation,
-                                       padding='same',
-                                       depth_multiplier=1,
-                                       use_bias=False,
-                                       name=f"sepconv1_block{i+1}")(x)
-        else:
-            x = layers.Conv1D(filters=num_filters,
-                          kernel_size=kernel_size,
-                          dilation_rate=dilation,
-                          padding='causal',
-                          kernel_initializer='he_normal',
-                          name=f"conv2_block{i+1}")(x)
-        x = layers.LayerNormalization(name=f"ln1_block{i+1}")(x)
-        x = layers.SpatialDropout1D(rate=dropout_rate,
-                                    name=f"drop1_block{i+1}")(x)
+    # fusión de skips (WaveNet-like)
+    s_sum = layers.Add(name="skip_sum")(skips) if len(skips) > 1 else skips[0]
+    s_sum = layers.Activation(gelu, name="skip_gelu")(s_sum)
+    s_sum = layers.LayerNormalization(name="skip_ln")(s_sum)
+    s_sum = layers.SpatialDropout1D(dropout_rate, name="skip_drop")(s_sum)
 
-        # second causal conv + norm + relu + dropout
-        if separable:
-            x = layers.SeparableConv1D(filters=num_filters,
-                                       kernel_size=kernel_size,
-                                       dilation_rate=dilation,
-                                       padding='same',
-                                       depth_multiplier=1,
-                                       use_bias=False,
-                                       name=f"sepconv2_block{i+1}")(x)
-        else:
-            x = layers.Conv1D(filters=num_filters,
-                          kernel_size=kernel_size,
-                          dilation_rate=dilation,
-                          padding='causal',
-                          kernel_initializer='he_normal',
-                          name=f"conv1_block{i+1}")(x)
-        
-        x = layers.LayerNormalization(name=f"ln2_block{i+1}")(x)
-        x = layers.Activation('relu', name=f"relu_block{i+1}")(x)
-        x = layers.SpatialDropout1D(rate=dropout_rate,
-                                    name=f"drop2_block{i+1}")(x)
-
-        # skip connection
-        if i == 0:
-            if separable:
-                skip = layers.SeparableConv1D(filters=num_filters,
-                                              kernel_size=1,
-                                              padding='same',
-                                              depth_multiplier=1,
-                                              use_bias=False,
-                                              name="sepconv_skip")(residual)
-            else:
-                skip = layers.Conv1D(filters=num_filters,
-                                 kernel_size=1,
-                                 padding='same',
-                                 kernel_initializer='he_normal',
-                                 name="conv_skip")(residual)
-            x = layers.Add(name=f"add_block{i+1}")([x, skip])
-        else:
-            x = layers.Add(name=f"add_block{i+1}")([x, residual])
-
-    # classification head (+ optional feature fusion)
+    # cabeza
     if time_step_classification:
-        # Time-step: if feat_input exists, broadcast and fuse
+        h = layers.Conv1D(num_filters, 1, padding="same", name="head_ts_proj")(s_sum)
+        h = layers.LayerNormalization(name="head_ts_ln")(h)
         if feat_input_dim is not None and feat_input_dim > 0:
-            f_in = layers.Input(shape=(feat_input_dim,), name="feat_input")
-            f_proj = layers.Dense(64, activation='relu', name='feat_proj')(f_in)
-            f_rep = layers.RepeatVector(input_shape[0], name='feat_repeat')(f_proj)  # broadcast to T length
-            x = layers.Concatenate(name='concat_ts')([x, f_rep])
-            head_inputs = [inputs, f_in]
+            # Modulación tardía adicional
+            h = FiLM1D(channels=num_filters, name="film_ts")(h, feat_in)
+        logits = layers.Conv1D(num_classes, 1, padding="same", name="fc_ts")(h)
+        if one_hot:
+            Out = layers.Softmax(name="softmax_ts")(logits)
         else:
-            head_inputs = inputs
-        x = layers.Dense(units=num_classes, kernel_initializer='he_normal', name="fc")(x)
+            Out = layers.Activation("sigmoid", name="sigmoid_ts")(logits)
+        inputs = [Inp, feat_in] if feat_in is not None else Inp
+
     else:
-        x = layers.GlobalAveragePooling1D(name="gap")(x)
+        # pooling por ventana
+        # combinación GAP + attention pooling (ligero)
+        xf = s_sum
+        gap = layers.GlobalAveragePooling1D(name="gap")(xf)
+        if use_attention_pool_win:
+            w = layers.Dense(1, name="attn_score")(xf)
+            w = layers.Softmax(axis=1, name="attn_sm")(w)
+            ap = K.sum(w * xf, axis=1)  # (B,C)
+            h = layers.Concatenate(name="pool_concat")([gap, ap])
+        else:
+            h = gap
+
+        h = layers.Dropout(dropout_rate, name="head_drop")(h)
         if feat_input_dim is not None and feat_input_dim > 0:
-            f_in = layers.Input(shape=(feat_input_dim,), name="feat_input")
-            f_proj = layers.Dense(64, activation='relu', name='feat_proj')(f_in)
-            x = layers.Concatenate(name='concat_win')([x, f_proj])
-            head_inputs = [inputs, f_in]
+            # FiLM también puede aplicarse aquí: proyectamos y modulamos
+            h = layers.Dense(num_filters, activation=gelu, name="head_fc")(h)
+            h = layers.Dropout(dropout_rate, name="head_fc_drop")(h)
+            # para FiLM necesitamos (B,T,C): extendemos T=1, modulamos y volvemos a aplanar
+            h = layers.Reshape((1, num_filters), name="head_rs")(h)
+            h = FiLM1D(channels=num_filters, name="film_win")(h, feat_in)
+            h = layers.Reshape((num_filters,), name="head_flat")(h)
+            inputs = [Inp, feat_in]
         else:
-            head_inputs = inputs
-        x = layers.Dense(units=num_classes, kernel_initializer='he_normal', name="fc")(x)
-    if one_hot:
-        outputs = layers.Softmax(name="softmax")(x)
-    else:
-        outputs =  layers.Dense(1, activation='sigmoid', name='output')(x)
-    model = models.Model(inputs=head_inputs, outputs=outputs, name="tcn_eegnet")
-    return model
+            h = layers.Dense(num_filters, activation=gelu, name="head_fc")(h)
+            h = layers.Dropout(dropout_rate, name="head_fc_drop")(h)
+            inputs = Inp
+
+        logits = layers.Dense(num_classes, name="fc")(h)
+        if one_hot:
+            Out = layers.Activation("softmax", name="softmax")(logits)
+        else:
+            Out = layers.Activation("sigmoid", name="sigmoid_win")(logits)
+
+    return models.Model(inputs=inputs, outputs=Out, name="tcn_eeg_v2")

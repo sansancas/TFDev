@@ -17,8 +17,19 @@ from tensorflow.keras import backend as K
 import absl.logging as absl
 from tqdm.keras import TqdmCallback
 from dataset import create_dataset_final_v2, write_tfrecord_splits_FINAL_CORRECTED, DEFAULT_EEG_FEATURES
-JIT = True
-tf.config.optimizer.set_jit(JIT)
+
+ENABLE_XLA = True                    # Master flag for XLA/JIT compilation
+JIT_COMPILE_MODEL = False             # JIT compile individual model layers (model.compile jit_compile=)
+JIT_GLOBAL = True                    # Global TensorFlow XLA setting
+
+# Apply XLA settings
+if ENABLE_XLA and JIT_GLOBAL:
+    tf.config.optimizer.set_jit(True)
+    print("XLA/JIT enabled globally")
+else:
+    tf.config.optimizer.set_jit(False)
+    print("XLA/JIT disabled globally")
+
 from tensorflow.keras.callbacks import Callback, CSVLogger, TerminateOnNaN, SwapEMAWeights, TensorBoard, BackupAndRestore
 from models.TCN import build_tcn
 from models.Hybrid import build_hybrid
@@ -37,12 +48,12 @@ WINDOW_SEC = 5.0             # Window length in seconds
 BATCH_SIZE = 12
 EPOCHS = 100
 USE_DROPOUT = True
-DROPOUT_RATE = 0.3
+DROPOUT_RATE = 0.25
 LEARNING_RATE = 2e-4
 MIN_LR_FRACTION = 0.05
 MIN_LR = LEARNING_RATE * MIN_LR_FRACTION
 WARMUP_RATIO = 0.1
-LIMITS={'train': 750, 'dev': 150, 'eval': 150}
+LIMITS={'train': 450, 'dev': 100, 'eval': 100}
 TIME_LIMIT_H = 48
 FRAME_HOP_SEC = 2.5
 SWEEP=False
@@ -63,11 +74,12 @@ RUNS_DIR = Path("./runs")
 RUN_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 RUN_DIR = RUNS_DIR / f"eeg_seizures_{RUN_STAMP}"
 
-MODEL = 'TRANS'  
+MODEL = 'HYB'  
 # Use focal losses if True; otherwise standard cross-entropy losses
 FOCAL = True
 CLASS_WEIGHTS = False
 BALANCED_STREAM = 0.2
+
 # Dataset window mode configuration:
 # - "default": hard window label
 # - "soft": soft label = frac of positive frames
@@ -100,7 +112,16 @@ FEATURES_AS_VECTOR = True
 # TCN-specific hyperparameters (used when MODEL == 'TCN')
 TCN_KERNEL_SIZE = 7
 TCN_BLOCKS = 7
+TCN_FILTERS = 64
+SE_RATIO = 16
 
+NUM_ATTENTION_HEADS=4
+RNN_UNITS=64
+
+EMBED_DIMENSION=128
+TRANS_LAYERS=4
+ATTENTION_HEADS=4
+MLP_DIMENSION=256
 # ---------------------- Run configuration snapshot ----------------------
 def save_run_config(run_dir: Path, extra: dict | None = None):
     cfg = {
@@ -129,6 +150,13 @@ def save_run_config(run_dir: Path, extra: dict | None = None):
         "FEATURES_AS_VECTOR": FEATURES_AS_VECTOR,
         "TCN_KERNEL_SIZE": TCN_KERNEL_SIZE,
         "TCN_BLOCKS": TCN_BLOCKS,
+        "SE_RATIO": SE_RATIO,
+        "NUM_ATTENTION_HEADS": NUM_ATTENTION_HEADS,
+        "RNN_UNITS": RNN_UNITS,
+        "EMBED_DIMENSION": EMBED_DIMENSION,
+        "TRANS_LAYERS": TRANS_LAYERS,
+        "ATTENTION_HEADS": ATTENTION_HEADS,
+        "MLP_DIMENSION": MLP_DIMENSION,
         "CUT": CUT,
         "TFRECORD_DIR": str(TFRECORD_DIR),
         "RUN_DIR": str(run_dir),
@@ -775,14 +803,14 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
             one_hot=ONEHOT,
             time_step=TIME_STEP,
             shuffle=False,
-            balance_pos_frac=None,
+            balance_pos_frac=(BALANCED_STREAM if BALANCED_STREAM and BALANCED_STREAM > 0 else None),
             balance_strategy='rejection',  # o 'undersample' configurable
             sample_rate=PREPROCESS['resample'],
             window_mode=WINDOW_MODE,
             feature_names=FEATURE_NAMES,
             return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP),
             cache=False,
-            prefetch=True
+            prefetch=False
         )
     # Count steps safely (cardinality may be UNKNOWN due to flat_map)
     _count_ds = _make_count_ds(train_paths)
@@ -854,7 +882,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                        if FOCAL else
                        CategoricalCrossentropy(from_logits=False))
         else:
-            loss_fn = (BinaryFocalCrossentropy(alpha=0.9, gamma=3)
+            loss_fn = (BinaryFocalCrossentropy(alpha=0.55, gamma=2)
                        if FOCAL else
                        BinaryCrossentropy(from_logits=False))
         optimizer = tf.keras.optimizers.AdamW(
@@ -874,8 +902,17 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                         one_hot=ONEHOT,
                         time_step=TIME_STEP,
                         feat_input_dim=feat_input_dim,
-                        # kernel_size=TCN_KERNEL_SIZE,
-                        num_filters=64,
+                        conv_type="conv",             # "conv" o "separable"
+                        num_filters=TCN_FILTERS,
+                        kernel_size=TCN_KERNEL_SIZE,
+                        se_ratio=SE_RATIO,
+                        dropout_rate=DROPOUT_RATE,
+                        num_heads=NUM_ATTENTION_HEADS,
+                        rnn_units=RNN_UNITS,
+                        use_se_after_cnn=True,
+                        use_se_after_rnn=True,
+                        use_between_attention=True,
+                        use_final_attention=True
                     )
                 case 'TRANS':
                     model = build_transformer(
@@ -883,21 +920,31 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                         num_classes=NUM_CLASSES,
                         time_step_classification=TIME_STEP,
                         one_hot=ONEHOT,
-                        hpc=HPC,
+                        # hpc=HPC,
                         use_se=USE_SE,
-                        feat_input_dim=feat_input_dim,
+                        embed_dim=EMBED_DIMENSION,
+                        num_layers=TRANS_LAYERS,
+                        num_heads=ATTENTION_HEADS,
+                        mlp_dim=MLP_DIMENSION,
+                        dropout_rate=DROPOUT_RATE,
+                        se_ratio=SE_RATIO,
                     )
                 case _:
                     model = build_tcn(
                         input_shape=(n_timepoints, eff_channels),
+                        num_filters=TCN_FILTERS,
+                        dropout_rate=DROPOUT_RATE,
                         num_classes=NUM_CLASSES,
                         kernel_size=TCN_KERNEL_SIZE,
                         num_blocks=TCN_BLOCKS,
                         time_step_classification=TIME_STEP,
                         one_hot=ONEHOT,
                         hpc=HPC,
-                        separable=True,
+                        separable=False,
                         feat_input_dim=feat_input_dim,
+                        cycle_dilations=(1,2,4,8),
+                        use_attention_pool_win=True,
+                        se_ratio=SE_RATIO,
                     )
 
         # Print receptive field info for TCN-like models
@@ -963,7 +1010,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                 optimizer=optimizer,
                 loss=loss_fn,
                 metrics=metrics,
-                jit_compile=JIT
+                jit_compile=JIT_COMPILE_MODEL
             )
 
     # Save model summary after build
@@ -1062,8 +1109,8 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
         # --- Early Stopping (choose ONE primary criterion) ---
         # Option B: stop by frame recall (if you still prefer frame-level behavior)
     earlystop_frame = tf.keras.callbacks.EarlyStopping(
-            monitor="val_brier_pos_seizure",
-            mode="min",
+            monitor="val_pr_auc",
+            mode="max",
             patience=15,
             min_delta=1e-4,
             restore_best_weights=True,
@@ -1165,7 +1212,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
 
 if __name__ == "__main__":
     # Example usage
-    data_root = '../DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3'
+    data_root = 'DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3'
     tn_timepoints = int(WINDOW_SEC * PREPROCESS['resample'])
     print(tn_timepoints)
     model, history = pipeline(data_root, n_timepoints=tn_timepoints, n_channels=22, write_ds=WRITE, limits=LIMITS)

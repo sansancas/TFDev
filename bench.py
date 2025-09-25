@@ -44,13 +44,155 @@ from sklearn.metrics import (
 
 from dataset import create_dataset_final_v2
 
+# ===================== Custom Model Loading Functions =====================
+
+def load_model_with_custom_objects(model_path: str):
+	"""Load model providing custom objects for old models without decorators."""
+	try:
+		# Import custom classes - try both old and new locations
+		custom_objects = {}
+		
+		# Try importing from models (new location with decorators)
+		try:
+			from models.Hybrid import FiLM1D as FiLM1D_Hybrid, AttentionPooling1D as AP1D_Hybrid
+			from models.TCN import FiLM1D as FiLM1D_TCN
+			from models.Transformer import (
+				FiLM1D as FiLM1D_Trans, 
+				MultiHeadSelfAttentionRoPE, 
+				AttentionPooling1D as AP1D_Trans, 
+				AddCLSToken
+			)
+			custom_objects.update({
+				'FiLM1D': FiLM1D_Hybrid,
+				'AttentionPooling1D': AP1D_Hybrid,
+				'MultiHeadSelfAttentionRoPE': MultiHeadSelfAttentionRoPE,
+				'AddCLSToken': AddCLSToken,
+			})
+		except ImportError:
+			pass
+		
+		# Try importing from models (old location)
+		try:
+			from models.Hybrid import FiLM1D as FiLM1D_Old_H, AttentionPooling1D as AP1D_Old_H
+			from models.TCN import FiLM1D as FiLM1D_Old_T
+			if 'FiLM1D' not in custom_objects:
+				custom_objects['FiLM1D'] = FiLM1D_Old_H
+			if 'AttentionPooling1D' not in custom_objects:
+				custom_objects['AttentionPooling1D'] = AP1D_Old_H
+		except ImportError:
+			pass
+		
+		print(f"Loading with custom_objects: {list(custom_objects.keys())}")
+		return tf.keras.models.load_model(model_path, custom_objects=custom_objects, compile=False)
+		
+	except Exception as e:
+		print(f"Custom objects loading failed: {e}")
+		raise
+
+
+def load_weights_only_fallback(model_path: str, cfg: dict, n_channels: int, n_timepoints: int):
+	"""Fallback: reconstruct model architecture and load weights only."""
+	try:
+		# Convert to Path object for easier handling
+		model_path = Path(model_path)
+		
+		# Try to reconstruct model from config
+		model_type = cfg.get('MODEL', 'TCN')
+		
+		if model_type == 'TCN':
+			from models.TCN import build_tcn
+			model = build_tcn(
+				input_shape=(n_timepoints, n_channels),
+				num_classes=2 if cfg.get('ONEHOT', False) else 1,
+				kernel_size=cfg.get('TCN_KERNEL_SIZE', 7),
+				num_blocks=cfg.get('TCN_BLOCKS', 7),
+				time_step_classification=cfg.get('TIME_STEP', False),
+				one_hot=cfg.get('ONEHOT', False),
+				hpc=cfg.get('HPC', False),
+				separable=True,
+				feat_input_dim=len(cfg.get('FEATURE_NAMES', [])) if cfg.get('FEATURES_AS_VECTOR', False) else None,
+			)
+		elif model_type == 'HYB':
+			from models.Hybrid import build_hybrid
+			model = build_hybrid(
+				input_shape=(n_timepoints, n_channels),
+				num_classes=2 if cfg.get('ONEHOT', False) else 1,
+				one_hot=cfg.get('ONEHOT', False),
+				time_step=cfg.get('TIME_STEP', False),
+				feat_input_dim=len(cfg.get('FEATURE_NAMES', [])) if cfg.get('FEATURES_AS_VECTOR', False) else None,
+			)
+		elif model_type == 'TRANS':
+			from models.Transformer import build_transformer
+			model = build_transformer(
+				input_shape=(n_timepoints, n_channels),
+				num_classes=2 if cfg.get('ONEHOT', False) else 1,
+				time_step_classification=cfg.get('TIME_STEP', False),
+				one_hot=cfg.get('ONEHOT', False),
+				hpc=cfg.get('HPC', False),
+			)
+		else:
+			raise ValueError(f"Unknown model type: {model_type}")
+		
+		# Try to find and load weights
+		weights_loaded = False
+		
+		# Strategy 3a: Look for corresponding .h5 weights in weights/ subdirectory
+		if model_path.suffix == '.keras':
+			# Extract epoch from filename if possible (e.g., pareto_f1_ep007.keras -> ep007)
+			import re
+			epoch_match = re.search(r'ep(\d+)', model_path.name)
+			if epoch_match:
+				epoch_num = epoch_match.group(1)
+				weights_dir = model_path.parent / "weights"
+				weights_file = weights_dir / f"ep{epoch_num}.weights.h5"
+				if weights_file.exists():
+					print(f"Found corresponding weights file: {weights_file}")
+					model.load_weights(str(weights_file))
+					weights_loaded = True
+				else:
+					print(f"No weights file found at: {weights_file}")
+			
+			# Strategy 3b: Look for any .h5 files in weights/ directory
+			if not weights_loaded:
+				weights_dir = model_path.parent / "weights"
+				if weights_dir.exists():
+					h5_files = sorted(weights_dir.glob("*.h5"))
+					if h5_files:
+						# Use the most recent weights file
+						latest_weights = max(h5_files, key=lambda p: p.stat().st_mtime)
+						print(f"Using latest weights file: {latest_weights}")
+						model.load_weights(str(latest_weights))
+						weights_loaded = True
+		
+		# Strategy 3c: Direct .h5 file
+		elif model_path.suffix == '.h5':
+			model.load_weights(str(model_path))
+			weights_loaded = True
+		
+		# Strategy 3d: Weights directory structure
+		else:
+			weights_path = model_path / "variables" / "variables"
+			if weights_path.exists():
+				model.load_weights(str(weights_path))
+				weights_loaded = True
+		
+		if not weights_loaded:
+			raise FileNotFoundError(f"No compatible weights found for {model_path}")
+		
+		print("Successfully reconstructed model and loaded weights")
+		return model
+		
+	except Exception as e:
+		print(f"Weights-only loading failed: {e}")
+		raise
+
 
 # ===================== User-configurable section =====================
 # Option A: Point to a run directory under ./runs (we'll auto-discover model & config)
 RUN_DIR: Optional[str] = None  # e.g., "./runs/eeg_seizures_20250911-151631"
 
 # Option B: Point directly to a Keras model file or SavedModel directory
-MODEL_PATH: Optional[str] = 'runs/eeg_seizures_20250913-110626/pareto_f1_ep022.keras'  # e.g., "./runs/eeg_seizures_xxx/best.keras"
+MODEL_PATH: Optional[str] = 'runs/eeg_seizures_20250923-081338/pareto_auc_ep014.keras'  # e.g., "./runs/eeg_seizures_xxx/best.keras"
 
 # If RUN_DIR is None, we'll pick the most recent run under RUNS_DIR
 RUNS_DIR = Path("./runs")
@@ -466,8 +608,30 @@ def main():
 
 	# Load model
 	print("Loading model…")
-	# Load without compiling to avoid requiring custom objects (e.g., AUCClass) at load time
-	model = tf.keras.models.load_model(model_path, compile=False)
+	# Try multiple loading strategies for models with custom classes
+	model = None
+	loading_strategies = [
+		# Strategy 1: Standard loading (works with properly decorated models)
+		lambda: tf.keras.models.load_model(str(model_path), compile=False),
+		
+		# Strategy 2: Load with custom objects (for older models without decorators)
+		lambda: load_model_with_custom_objects(str(model_path)),
+		
+		# Strategy 3: Load weights only (fallback method)
+		lambda: load_weights_only_fallback(str(model_path), cfg, n_channels, n_timepoints)
+	]
+	
+	for i, strategy in enumerate(loading_strategies, 1):
+		try:
+			print(f"Trying loading strategy {i}...")
+			model = strategy()
+			print(f"✓ Successfully loaded model using strategy {i}")
+			break
+		except Exception as e:
+			print(f"Strategy {i} failed: {e}")
+			if i == len(loading_strategies):
+				raise RuntimeError("All loading strategies failed") from e
+	
 	model.summary(print_fn=lambda s: None)
 
 	# Iterate and collect predictions
