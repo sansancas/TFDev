@@ -172,6 +172,22 @@ class AddCLSToken(layers.Layer):
         cls_batched = K.tile(self.cls, (b, 1, 1))
         return K.concatenate([cls_batched, x], axis=1)
 
+@tf.keras.utils.register_keras_serializable()
+class AddScalarMSELoss(layers.Layer):
+    """Layer that adds weight * mean(square(x)) to the model loss and passes x through.
+    Use it to register auxiliary losses (Koopman/Recon) without calling model.add_loss.
+    """
+    def __init__(self, weight: float, name: str | None = None):
+        super().__init__(name=name, trainable=False)
+        self.weight = float(weight)
+
+
+    def call(self, x):
+        if self.weight > 0.0:
+            loss = tf.reduce_mean(tf.square(x))
+            self.add_loss(self.weight * loss)
+        return x
+
 # ---------- Encoder Transformer con RoPE ----------
 def transformer_block_rope(x, embed_dim, num_heads, mlp_dim, dropout_rate, name):
     attn = MultiHeadSelfAttentionRoPE(embed_dim, num_heads, attn_dropout=dropout_rate, name=name+"_mha")(x)
@@ -188,7 +204,7 @@ def transformer_block_rope(x, embed_dim, num_heads, mlp_dim, dropout_rate, name)
 
 # ---------- Modelo principal ----------
 def build_transformer(
-    input_shape,                 # (T, C)  -> T tiempo, C canales (o features por canal ya apilados)
+    input_shape,                 # (T, C)
     num_classes=2,
     embed_dim=128,
     num_layers=4,
@@ -199,7 +215,17 @@ def build_transformer(
     one_hot=True,
     use_se=False,     # si quieres enchufar tu se_block_1d
     se_ratio=16,
-    feat_input_dim=None  # dim de features contextuales por ventana/sesión
+    feat_input_dim=None,  # dim de features contextuales por ventana/sesión
+    # ===== NUEVO: Koopman head =====
+    koopman_latent_dim: int = 0,         # 0 = desactivado
+    koopman_loss_weight: float = 0.0,    # e.g., 0.1
+    # ===== NUEVO: Reconstrucción (AE) =====
+    use_reconstruction_head: bool = False,
+    recon_weight: float = 0.0,           # e.g., 0.05
+    recon_target: str = "signal",        # "signal" (aquí reconstruiremos el embedding de proyección)
+    # ===== NUEVO: Bottleneck / Expansión =====
+    bottleneck_dim: int | None = None,
+    expand_dim: int | None = None,
 ):
     inp = layers.Input(shape=input_shape, name="input")
     x = inp
@@ -219,6 +245,7 @@ def build_transformer(
     # Proyección a embedding
     x = layers.Dense(embed_dim, name="proj")(x)
     x = layers.Dropout(dropout_rate, name="proj_dropout")(x)
+    proj_in = x  # guardamos para reconstrucción (T', E)
 
     # Token [CLS] como capa
     x = AddCLSToken(embed_dim, name="cls")(x)
@@ -237,10 +264,48 @@ def build_transformer(
         if use_se and i in (0, num_layers-1):
             x = se_block_1d(x, se_ratio=se_ratio, name=f"se_enc_{i+1}")
 
+    # ====== Latentes para heads auxiliares ======
+    # body sin [CLS]
+    latent_body = layers.Lambda(lambda t: t[:, 1:, :], name="latent_body")(x)    # (B, T', E)
+    # Proyección/normalización ligera para cabezas auxiliares (Koop/AE)
+    aux_latent = layers.Dense(embed_dim, name="latent_proj")(latent_body)
+    aux_latent = layers.LayerNormalization(name="latent_ln")(aux_latent)
+
+    # ===== Koopman head (opcional) =====
+    koop_weighted = None
+    if koopman_latent_dim and koopman_latent_dim > 0 and koopman_loss_weight > 0.0:
+        z_seq = layers.Dense(koopman_latent_dim, name="koop_z")(aux_latent)   # (B, T', dk)
+        z_t  = layers.Lambda(lambda t: t[:, :-1, :], name="koop_t")(z_seq)
+        z_tp = layers.Lambda(lambda t: t[:, 1:,  :], name="koop_tp")(z_seq)
+        A = layers.Dense(koopman_latent_dim, use_bias=False, name="koop_A")
+        z_pred = A(z_t)
+        diff = layers.Subtract(name="koop_diff")([z_tp, z_pred])
+        # koop_mse = layers.Lambda(lambda d: tf.reduce_mean(tf.square(d)), name="koop_mse")(diff)
+        # koop_weighted = layers.Lambda(lambda v: v * koopman_loss_weight, name="koop_weight")(koop_mse)
+        _ = AddScalarMSELoss(koopman_loss_weight, name="koop_loss")(diff)
+
+    # ===== Reconstrucción (autoencoder ligero) =====
+    recon_weighted = None
+    if use_reconstruction_head and recon_weight > 0.0:
+        # Reconstruiremos el embedding proj_in (más estable que remontar a señal cruda aquí)
+        dec = aux_latent
+        dec = layers.Dense(embed_dim, activation=gelu, name="recon_fc1")(dec)
+        x_rec = layers.Dense(embed_dim, name="recon_out")(dec)  # (B, T', E)
+        # Alineamos shapes con proj_in
+        rdiff = layers.Subtract(name="recon_diff")([proj_in, x_rec])
+        # r_mse = layers.Lambda(lambda d: tf.reduce_mean(tf.square(d)), name="recon_mse")(rdiff)
+        # recon_weighted = layers.Lambda(lambda v: v * recon_weight, name="recon_weight")(r_mse)
+        _ = AddScalarMSELoss(koopman_loss_weight, name="recon_loss")(rdiff)
+
     # --- Cabezas ---
     if time_step_classification:
-        # Slicing seguro: Lambda (evita posibles rarezas con []
-        x_frames = layers.Lambda(lambda t: t[:, 1:, :], name="slice_drop_cls")(x)
+        # Slicing seguro: quitar [CLS]
+        x_frames = layers.Lambda(lambda t: t[:, 1:, :], name="slice_drop_cls_out")(x)
+        # Bottleneck/expansión opcional
+        if bottleneck_dim:
+            x_frames = layers.Dense(bottleneck_dim, activation=gelu, name="bneck_ts")(x_frames)
+            if expand_dim:
+                x_frames = layers.Dense(expand_dim, activation=gelu, name="expand_ts")(x_frames)
         logits = layers.Dense(num_classes, name="fc_frames")(x_frames)
         if one_hot:
             out = layers.Softmax(name="softmax_ts")(logits)
@@ -252,6 +317,11 @@ def build_transformer(
         attn_pool = AttentionPooling1D(name="attnpool")(body)
         h = layers.Concatenate(name="win_head_concat")([cls_token, attn_pool])
         h = layers.Dropout(dropout_rate, name="win_head_drop")(h)
+        # Bottleneck/expansión opcional
+        if bottleneck_dim:
+            h = layers.Dense(bottleneck_dim, activation=gelu, name="bneck_win")(h)
+            if expand_dim:
+                h = layers.Dense(expand_dim, activation=gelu, name="expand_win")(h)
         logits = layers.Dense(num_classes, name="fc_window")(h)
         if one_hot:
             out = layers.Softmax(name="softmax_win")(logits)
@@ -259,4 +329,6 @@ def build_transformer(
             out = layers.Dense(1, activation='sigmoid', name='sigmoid_win')(logits)
 
     inputs = [inp] if feat_inp is None else [inp, feat_inp]
-    return models.Model(inputs=inputs, outputs=out, name="eeg_transformer_rope_film")
+    model = models.Model(inputs=inputs, outputs=out, name="eeg_transformer_rope_film")
+
+    return model

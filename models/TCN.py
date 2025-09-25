@@ -14,20 +14,27 @@ def se_block_1d(x, se_ratio=16, name="se"):
     return layers.Multiply(name=f"{name}_sc")([x, s])
 
 @tf.keras.utils.register_keras_serializable()
+class AddScalarMSELoss(layers.Layer):
+    """Layer that adds weight * mean(square(x)) to the model loss and passes x through.
+    Use it to register auxiliary losses (Koopman/Recon) without calling model.add_loss.
+    """
+    def __init__(self, weight: float, name: str | None = None):
+        super().__init__(name=name, trainable=False)
+        self.weight = float(weight)
+
+
+    def call(self, x):
+        if self.weight > 0.0:
+            loss = tf.reduce_mean(tf.square(x))
+            self.add_loss(self.weight * loss)
+        return x
+    
+@tf.keras.utils.register_keras_serializable()
 class FiLM1D(layers.Layer):
-    def __init__(self, channels, name=None, **kwargs):
-        super().__init__(name=name, **kwargs)
-        self.channels = channels
+    def __init__(self, channels, name=None):
+        super().__init__(name=name)
         self.dg = layers.Dense(channels, name=(name or "film")+"_g")
         self.db = layers.Dense(channels, name=(name or "film")+"_b")
-    
-    def get_config(self):
-        config = super().get_config()
-        config.update({
-            "channels": self.channels,
-        })
-        return config
-    
     def call(self, x, f):
         # x: (B,T,C), f: (B,F)
         g = self.dg(f)[:, tf.newaxis, :]
@@ -86,41 +93,63 @@ def gated_res_block(x, filters, kernel_size, dilation, separable, se_ratio, name
     out = layers.SpatialDropout1D(0.1, name=f"{name}_drop")(out)
     return out, skip
 
+# PASTE this function into your TCN.py (replace the existing build_tcn)
+from tensorflow.keras import layers, models
+from keras import ops as K
+import tensorflow as tf
+
+
 def build_tcn(input_shape,
-                 num_classes=2,
-                 num_filters=64,
-                 kernel_size=7,
-                 dropout_rate=0.25,
-                 num_blocks=8,
-                 time_step_classification=True,
-                 one_hot=True,
-                 hpc=False,
-                 separable=False,
-                 se_ratio=16,
-                 cycle_dilations=(1,2,4,8),
-                 feat_input_dim: int | None = None,
-                 use_attention_pool_win=True):
+                num_classes=2,
+                num_filters=64,
+                kernel_size=7,
+                dropout_rate=0.25,
+                num_blocks=8,
+                time_step_classification=True,
+                one_hot=True,
+                hpc=False,
+                separable=False,
+                se_ratio=16,
+                cycle_dilations=(1,2,4,8),
+                feat_input_dim: int | None = None,
+                use_attention_pool_win=True,
+                # === Koopman head ===
+                koopman_latent_dim: int = 0,         # 0 = desactivado
+                koopman_loss_weight: float = 0.0,    # e.g., 0.1
+                # === Reconstrucción (AE) ===
+                use_reconstruction_head: bool = False,
+                recon_weight: float = 0.0,           # e.g., 0.05
+                recon_target: str = "signal",        # "signal" (por ahora)
+                # === Bottleneck / Expansión ===
+                bottleneck_dim: int | None = None,
+                expand_dim: int | None = None):
     """
-    Mejora sobre tu TCN:
-    - Bloques residuales 'gated' + skip global acumulado
-    - Causalidad estricta también en separables
-    - SE por bloque
-    - FiLM para fusionar features
-    - Cycling de dilataciones
-    - Attention pooling opcional en ventana
+    Extiende tu TCN con:
+      - Head de Koopman (z_{t+1} ≈ A z_t) vía add_loss
+      - Head de reconstrucción ligera (autoencoder) vía add_loss
+      - Bottleneck/expansión antes de logits (time-step y window)
+    Mantiene compatibilidad con FiLM y los modos de salida.
     """
     dtype = 'float32' if hpc else None
     Inp = layers.Input(shape=input_shape, dtype=dtype, name="input")
     x = Inp
 
+
+    try:
+        if isinstance(feat_input_dim, (tuple, list)):
+            feat_input_dim = feat_input_dim[0]
+        if feat_input_dim is not None:
+            feat_input_dim = int(feat_input_dim)
+    except Exception:
+        feat_input_dim = None
     # FiLM temprano si hay features globales
     feat_in = None
     if feat_input_dim is not None and feat_input_dim > 0:
+        # FiLM1D ya está definido en tu archivo original
         feat_in = layers.Input(shape=(feat_input_dim,), name="feat_input")
         x = FiLM1D(channels=input_shape[-1], name="film_in")(x, feat_in)
 
     skips = []
-    # pila de bloques
     for i in range(num_blocks):
         dilation = cycle_dilations[i % len(cycle_dilations)]
         x, s = gated_res_block(x, num_filters, kernel_size, dilation,
@@ -129,17 +158,50 @@ def build_tcn(input_shape,
 
     # fusión de skips (WaveNet-like)
     s_sum = layers.Add(name="skip_sum")(skips) if len(skips) > 1 else skips[0]
-    s_sum = layers.Activation(gelu, name="skip_gelu")(s_sum)
+    s_sum = layers.Activation(activations.gelu, name="skip_gelu")(s_sum)
     s_sum = layers.LayerNormalization(name="skip_ln")(s_sum)
     s_sum = layers.SpatialDropout1D(dropout_rate, name="skip_drop")(s_sum)
 
-    # cabeza
+    # ===== Secuencia latente común para heads auxiliares =====
+    latent_seq = layers.Conv1D(num_filters, 1, padding="same", name="latent_proj")(s_sum)
+    latent_seq = layers.LayerNormalization(name="latent_ln")(latent_seq)
+
+    # ===== Koopman head (opcional) =====
+    koop_weighted = None
+    if koopman_latent_dim and koopman_latent_dim > 0 and koopman_loss_weight > 0.0:
+        z_seq = layers.Dense(koopman_latent_dim, name="koop_z")(latent_seq)  # (B,T,dk)
+        z_t  = layers.Lambda(lambda t: t[:, :-1, :], name="koop_t")(z_seq)
+        z_tp = layers.Lambda(lambda t: t[:, 1:,  :], name="koop_tp")(z_seq)
+        A = layers.Dense(koopman_latent_dim, use_bias=False, name="koop_A")
+        z_pred = A(z_t)
+        diff = layers.Subtract(name="koop_diff")([z_tp, z_pred])
+        _ = AddScalarMSELoss(koopman_loss_weight, name="koop_loss")(diff)
+        # koop_mse = layers.Lambda(lambda d: tf.reduce_mean(tf.square(d)), name="koop_mse")(diff)
+        # koop_weighted = layers.Lambda(lambda v: v * koopman_loss_weight, name="koop_weight")(koop_mse)
+
+    # ===== Reconstrucción (autoencoder ligero) =====
+    recon_weighted = None
+    if use_reconstruction_head and recon_weight > 0.0 and recon_target == "signal":
+        dec = latent_seq
+        dec = layers.Conv1D(num_filters, 3, padding="same", activation=activations.gelu, name="recon_c1")(dec)
+        dec = layers.Conv1D(max(1, num_filters//2), 3, padding="same", activation=activations.gelu, name="recon_c2")(dec)
+        x_rec = layers.Conv1D(input_shape[-1], 1, padding="same", name="recon_out")(dec)  # (B,T,Cin)
+        rdiff = layers.Subtract(name="recon_diff")([Inp, x_rec])
+        # r_mse = layers.Lambda(lambda d: tf.reduce_mean(tf.square(d)), name="recon_mse")(rdiff)
+        # recon_weighted = layers.Lambda(lambda v: v * recon_weight, name="recon_weight")(r_mse)
+        _ = AddScalarMSELoss(koopman_loss_weight, name="recon_loss")(rdiff)
+
+    # ===== Cabeza principal =====
     if time_step_classification:
         h = layers.Conv1D(num_filters, 1, padding="same", name="head_ts_proj")(s_sum)
         h = layers.LayerNormalization(name="head_ts_ln")(h)
         if feat_input_dim is not None and feat_input_dim > 0:
-            # Modulación tardía adicional
             h = FiLM1D(channels=num_filters, name="film_ts")(h, feat_in)
+        # Bottleneck/expansión (time-step)
+        if bottleneck_dim:
+            h = layers.Conv1D(bottleneck_dim, 1, padding="same", activation=activations.gelu, name="bneck_ts")(h)
+            if expand_dim:
+                h = layers.Conv1D(expand_dim, 1, padding="same", activation=activations.gelu, name="expand_ts")(h)
         logits = layers.Conv1D(num_classes, 1, padding="same", name="fc_ts")(h)
         if one_hot:
             Out = layers.Softmax(name="softmax_ts")(logits)
@@ -148,8 +210,6 @@ def build_tcn(input_shape,
         inputs = [Inp, feat_in] if feat_in is not None else Inp
 
     else:
-        # pooling por ventana
-        # combinación GAP + attention pooling (ligero)
         xf = s_sum
         gap = layers.GlobalAveragePooling1D(name="gap")(xf)
         if use_attention_pool_win:
@@ -162,18 +222,22 @@ def build_tcn(input_shape,
 
         h = layers.Dropout(dropout_rate, name="head_drop")(h)
         if feat_input_dim is not None and feat_input_dim > 0:
-            # FiLM también puede aplicarse aquí: proyectamos y modulamos
-            h = layers.Dense(num_filters, activation=gelu, name="head_fc")(h)
+            h = layers.Dense(num_filters, activation=activations.gelu, name="head_fc")(h)
             h = layers.Dropout(dropout_rate, name="head_fc_drop")(h)
-            # para FiLM necesitamos (B,T,C): extendemos T=1, modulamos y volvemos a aplanar
             h = layers.Reshape((1, num_filters), name="head_rs")(h)
             h = FiLM1D(channels=num_filters, name="film_win")(h, feat_in)
             h = layers.Reshape((num_filters,), name="head_flat")(h)
             inputs = [Inp, feat_in]
         else:
-            h = layers.Dense(num_filters, activation=gelu, name="head_fc")(h)
+            h = layers.Dense(num_filters, activation=activations.gelu, name="head_fc")(h)
             h = layers.Dropout(dropout_rate, name="head_fc_drop")(h)
             inputs = Inp
+
+        # Bottleneck/expansión (window)
+        if bottleneck_dim:
+            h = layers.Dense(bottleneck_dim, activation=activations.gelu, name="bneck_win")(h)
+            if expand_dim:
+                h = layers.Dense(expand_dim, activation=activations.gelu, name="expand_win")(h)
 
         logits = layers.Dense(num_classes, name="fc")(h)
         if one_hot:
@@ -181,4 +245,12 @@ def build_tcn(input_shape,
         else:
             Out = layers.Activation("sigmoid", name="sigmoid_win")(logits)
 
-    return models.Model(inputs=inputs, outputs=Out, name="tcn_eeg_v2")
+    model = models.Model(inputs=inputs, outputs=Out, name="tcn_eeg_v2")
+
+    # # Registrar pérdidas auxiliares
+    # if koop_weighted is not None:
+    #     model.add_loss(koop_weighted)
+    # if recon_weighted is not None:
+    #     model.add_loss(recon_weighted)
+
+    return model

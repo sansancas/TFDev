@@ -7,11 +7,12 @@ from pathlib import Path
 from datetime import datetime
 import logging
 from typing import Dict, Optional
+import json
 
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import mixed_precision
-from tensorflow.keras.losses import BinaryFocalCrossentropy, CategoricalFocalCrossentropy, BinaryCrossentropy, CategoricalCrossentropy# , Tversky, Loss, Reduction
+from tensorflow.keras.losses import BinaryFocalCrossentropy, CategoricalFocalCrossentropy, BinaryCrossentropy, CategoricalCrossentropy , Tversky#, Loss, Reduction
 from tensorflow.keras import layers, models
 from tensorflow.keras import backend as K
 import absl.logging as absl
@@ -48,7 +49,7 @@ WINDOW_SEC = 5.0             # Window length in seconds
 BATCH_SIZE = 12
 EPOCHS = 100
 USE_DROPOUT = True
-DROPOUT_RATE = 0.25
+DROPOUT_RATE = 0.2
 LEARNING_RATE = 2e-4
 MIN_LR_FRACTION = 0.05
 MIN_LR = LEARNING_RATE * MIN_LR_FRACTION
@@ -74,11 +75,12 @@ RUNS_DIR = Path("./runs")
 RUN_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 RUN_DIR = RUNS_DIR / f"eeg_seizures_{RUN_STAMP}"
 
-MODEL = 'HYB'  
+MODEL = 'TCN'  
 # Use focal losses if True; otherwise standard cross-entropy losses
 FOCAL = True
+TVERSKY = False
 CLASS_WEIGHTS = False
-BALANCED_STREAM = 0.2
+BALANCED_STREAM = None #0.2
 
 # Dataset window mode configuration:
 # - "default": hard window label
@@ -109,19 +111,46 @@ FEATURE_NAMES = [
 # and models will use a dual-input path for better efficiency.
 FEATURES_AS_VECTOR = True
 
-# TCN-specific hyperparameters (used when MODEL == 'TCN')
+# ===== DMD / Koopman-aux features (dataset-side) =====
+ENABLE_DMD_FEATURES = True
+DMD_OPTS = {"n_modes": 8, "subsample": 2}
+INCLUDE_LABEL_FEATS = False # Append [y_soft, y_hard] to features vector for inspection
+
+
+# ===== Domain ID (for inter-patient generalization / DA) =====
+RETURN_DOMAIN_ID = True # If True, dataset returns domain input (patient/record)
+DOMAIN_FROM = "patient" # "patient" | "record"
+DOMAIN_TO_INT = True
+DOMAIN_NUM_BUCKETS = 4096
+INCLUDE_PATIENTS = None # e.g., [b"pt_001", b"pt_002"]
+EXCLUDE_PATIENTS = None # e.g., [b"heldout_pt"]
+USE_DOMAIN_INPUT_IN_MODEL = True
+
+# ===================== Model hyperparams =====================
 TCN_KERNEL_SIZE = 7
 TCN_BLOCKS = 7
 TCN_FILTERS = 64
 SE_RATIO = 16
 
+
 NUM_ATTENTION_HEADS=4
 RNN_UNITS=64
+
 
 EMBED_DIMENSION=128
 TRANS_LAYERS=4
 ATTENTION_HEADS=4
 MLP_DIMENSION=256
+
+
+# ===== Regularizers / Aux heads =====
+KOOPMAN_LATENT_DIM = 64
+KOOPMAN_LOSS_WEIGHT = 0.1
+USE_RECONSTRUCTION_HEAD = True
+RECON_WEIGHT = 0.05
+RECON_TARGET = "signal" # for Transformer we reconstruct projection embedding
+BOTTLENECK_DIM = 128 #128
+EXPAND_DIM = 256
 # ---------------------- Run configuration snapshot ----------------------
 def save_run_config(run_dir: Path, extra: dict | None = None):
     cfg = {
@@ -148,8 +177,18 @@ def save_run_config(run_dir: Path, extra: dict | None = None):
         "WINDOW_MODE": WINDOW_MODE,
         "FEATURE_NAMES": FEATURE_NAMES,
         "FEATURES_AS_VECTOR": FEATURES_AS_VECTOR,
+        "ENABLE_DMD_FEATURES": ENABLE_DMD_FEATURES,
+        "DMD_OPTS": DMD_OPTS,
+        "INCLUDE_LABEL_FEATS": INCLUDE_LABEL_FEATS,
+        "RETURN_DOMAIN_ID": RETURN_DOMAIN_ID,
+        "DOMAIN_FROM": DOMAIN_FROM,
+        "DOMAIN_TO_INT": DOMAIN_TO_INT,
+        "DOMAIN_NUM_BUCKETS": DOMAIN_NUM_BUCKETS,
+        "INCLUDE_PATIENTS": INCLUDE_PATIENTS,
+        "EXCLUDE_PATIENTS": EXCLUDE_PATIENTS,
         "TCN_KERNEL_SIZE": TCN_KERNEL_SIZE,
         "TCN_BLOCKS": TCN_BLOCKS,
+        "TCN_FILTERS": TCN_FILTERS,
         "SE_RATIO": SE_RATIO,
         "NUM_ATTENTION_HEADS": NUM_ATTENTION_HEADS,
         "RNN_UNITS": RNN_UNITS,
@@ -159,12 +198,18 @@ def save_run_config(run_dir: Path, extra: dict | None = None):
         "MLP_DIMENSION": MLP_DIMENSION,
         "CUT": CUT,
         "TFRECORD_DIR": str(TFRECORD_DIR),
+        "KOOPMAN_LATENT_DIM": KOOPMAN_LATENT_DIM,
+        "KOOPMAN_LOSS_WEIGHT": KOOPMAN_LOSS_WEIGHT,
+        "USE_RECONSTRUCTION_HEAD": USE_RECONSTRUCTION_HEAD,
+        "RECON_WEIGHT": RECON_WEIGHT,
+        "RECON_TARGET": RECON_TARGET,
+        "BOTTLENECK_DIM": BOTTLENECK_DIM,
+        "EXPAND_DIM": EXPAND_DIM,
         "RUN_DIR": str(run_dir),
     }
     if extra:
         cfg.update(extra)
     run_dir.mkdir(parents=True, exist_ok=True)
-    import json
     with open(run_dir / "run_config.json", "w") as f:
         json.dump(cfg, f, indent=2)
 
@@ -742,6 +787,34 @@ def inspect_dataset(ds: tf.data.Dataset, num_batches: int | None = 3, positive_l
     prev = (total_pos / total_items) if total_items else 0.0
     print(f"\nTotal: {total_pos}/{total_items} positives → {prev:.2%} prevalence")
 
+def _flatten_inputs(inputs):
+    return tf.nest.flatten(inputs)
+
+
+def autodetect_feat_dim_from_dataset(ds):
+    """Peek one element of `ds` and return (feat_dim_or_None, has_domain_bool).
+    - EEG is assumed to be rank-3 (B,T,C)
+    - Feature vector is rank-2 (B,F)
+    - Domain id is rank-1 (B,)
+    This function performs NO mapping; it only reads shapes.
+    """
+    if ds is None:
+        return None, False
+    for elem in ds.take(1):
+        # elem can be (inputs, y) or ((inputs...), y)
+        if isinstance(elem, (tuple, list)) and len(elem) == 2:
+            inputs, _ = elem
+        else:
+            # unexpected, just bail out gracefully
+            return None, False
+        flat = _flatten_inputs(inputs)
+        eeg = next((t for t in flat if getattr(t, 'shape', None) is not None and len(t.shape) == 3), None)
+        feats = next((t for t in flat if getattr(t, 'shape', None) is not None and len(t.shape) == 2), None)
+        domain = next((t for t in flat if getattr(t, 'shape', None) is not None and len(t.shape) == 1), None)
+        feat_dim = int(feats.shape[-1]) if feats is not None and feats.shape.rank == 2 else None
+        return feat_dim, (domain is not None)
+    return None, False
+
 def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write_ds=True, limits=None):
 
     if write_ds:
@@ -777,40 +850,67 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
 
     def _make_train_ds(paths):
         return create_dataset_final_v2(
-            paths,
+            train_paths,
             n_channels=n_channels,
             n_timepoints=n_timepoints,
             batch_size=BATCH_SIZE,
             one_hot=ONEHOT,
             time_step=TIME_STEP,
-            shuffle=True,
-            balance_pos_frac=(BALANCED_STREAM if BALANCED_STREAM and BALANCED_STREAM > 0 else None),
-            balance_strategy='rejection',  # o 'undersample' configurable
-            sample_rate=PREPROCESS['resample'],
-            window_mode=WINDOW_MODE,
-            feature_names=FEATURE_NAMES,
-            return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP),
             cache=False,
-            prefetch=True
+            drop_remainder=False,
+            shuffle=True,
+            shuffle_buffer=4096,
+            window_mode=WINDOW_MODE,
+            include_label_feats=INCLUDE_LABEL_FEATS,
+            sample_rate=PREPROCESS['resample'],
+            feature_names=FEATURE_NAMES,
+            return_feature_vector=FEATURES_AS_VECTOR,
+            prefetch=True,
+            balance_strategy='undersample' if BALANCED_STREAM else 'none',
+            enable_dmd_features=ENABLE_DMD_FEATURES,
+            dmd_n_modes=DMD_OPTS.get('n_modes', 8),
+            dmd_subsample=DMD_OPTS.get('subsample', 2),
+            return_domain_id=RETURN_DOMAIN_ID,
+            domain_from=DOMAIN_FROM,
+            domain_to_int=DOMAIN_TO_INT,
+            domain_num_buckets=DOMAIN_NUM_BUCKETS,
+            include_patients=INCLUDE_PATIENTS,
+            exclude_patients=EXCLUDE_PATIENTS,
+            balance_pos_frac=BALANCED_STREAM if BALANCED_STREAM else None,
+            use_domain_in_output=False,
+        
         )
     def _make_count_ds(paths):
         # Para estimar steps y class weights no aplicamos balance
         return create_dataset_final_v2(
-            paths,
+            train_paths,
             n_channels=n_channels,
             n_timepoints=n_timepoints,
             batch_size=BATCH_SIZE,
             one_hot=ONEHOT,
             time_step=TIME_STEP,
-            shuffle=False,
-            balance_pos_frac=(BALANCED_STREAM if BALANCED_STREAM and BALANCED_STREAM > 0 else None),
-            balance_strategy='rejection',  # o 'undersample' configurable
-            sample_rate=PREPROCESS['resample'],
-            window_mode=WINDOW_MODE,
-            feature_names=FEATURE_NAMES,
-            return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP),
             cache=False,
-            prefetch=False
+            drop_remainder=False,
+            shuffle=False,
+            shuffle_buffer=4096,
+            window_mode=WINDOW_MODE,
+            include_label_feats=INCLUDE_LABEL_FEATS,
+            sample_rate=PREPROCESS['resample'],
+            feature_names=FEATURE_NAMES,
+            return_feature_vector=FEATURES_AS_VECTOR,
+            prefetch=False,
+            balance_strategy='undersample' if BALANCED_STREAM else 'none',
+            enable_dmd_features=ENABLE_DMD_FEATURES,
+            dmd_n_modes=DMD_OPTS.get('n_modes', 8),
+            dmd_subsample=DMD_OPTS.get('subsample', 2),
+            return_domain_id=RETURN_DOMAIN_ID,
+            domain_from=DOMAIN_FROM,
+            domain_to_int=DOMAIN_TO_INT,
+            domain_num_buckets=DOMAIN_NUM_BUCKETS,
+            include_patients=INCLUDE_PATIENTS,
+            exclude_patients=EXCLUDE_PATIENTS,
+            balance_pos_frac=None,
+            use_domain_in_output=False,
         )
     # Count steps safely (cardinality may be UNKNOWN due to flat_map)
     _count_ds = _make_count_ds(train_paths)
@@ -840,29 +940,46 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
         print(f"Internal balancing active (strategy=rejection) target pos frac {BALANCED_STREAM}")
 
     val_ds = create_dataset_final_v2(
-        val_paths,
-        n_channels=n_channels,
-        n_timepoints=n_timepoints,
-        batch_size=BATCH_SIZE,
-        one_hot=ONEHOT,
-        time_step=TIME_STEP,
-        shuffle=False,
-        balance_pos_frac=None,
-        sample_rate=PREPROCESS['resample'],
-        window_mode=WINDOW_MODE,
-        feature_names=FEATURE_NAMES,
-        return_feature_vector=(FEATURES_AS_VECTOR and WINDOW_MODE=="features" and not TIME_STEP),
-        cache=False,
-        prefetch=True
+            val_paths,
+            n_channels=n_channels,
+            n_timepoints=n_timepoints,
+            batch_size=BATCH_SIZE,
+            one_hot=ONEHOT,
+            time_step=TIME_STEP,
+            cache=False,
+            drop_remainder=False,
+            shuffle=False,
+            shuffle_buffer=4096,
+            window_mode=WINDOW_MODE,
+            include_label_feats=INCLUDE_LABEL_FEATS,
+            sample_rate=PREPROCESS['resample'],
+            feature_names=FEATURE_NAMES,
+            return_feature_vector=FEATURES_AS_VECTOR,
+            prefetch=True,
+            balance_strategy='undersample' if BALANCED_STREAM else 'none',
+            enable_dmd_features=ENABLE_DMD_FEATURES,
+            dmd_n_modes=DMD_OPTS.get('n_modes', 8),
+            dmd_subsample=DMD_OPTS.get('subsample', 2),
+            return_domain_id=RETURN_DOMAIN_ID,
+            domain_from=DOMAIN_FROM,
+            domain_to_int=DOMAIN_TO_INT,
+            domain_num_buckets=DOMAIN_NUM_BUCKETS,
+            include_patients=INCLUDE_PATIENTS,
+            exclude_patients=EXCLUDE_PATIENTS,
+            balance_pos_frac=None,
+            use_domain_in_output=False,
     )
 
-    inspect_dataset(_count_ds, num_batches=10000)
-    inspect_dataset(val_ds, num_batches=10000)
+    inspect_dataset(_count_ds, num_batches=1000)
+    
+    inspect_dataset(val_ds, num_batches=1000)
+
+    feat_dim_detected, had_domain = autodetect_feat_dim_from_dataset(train_ds)
 
     # Compute effective input channels and whether we have a separate features vector
     eff_channels = n_channels
     use_feat_vec = (FEATURES_AS_VECTOR and WINDOW_MODE == "features" and not TIME_STEP)
-    feat_input_dim = len(FEATURE_NAMES) if (WINDOW_MODE == "features" and not TIME_STEP and FEATURES_AS_VECTOR) else None
+    feat_input_dim = feat_input_dim = int(feat_dim_detected) if feat_dim_detected is not None else None
     if WINDOW_MODE == "features" and not TIME_STEP and not FEATURES_AS_VECTOR:
         # concatenated to channels per time step
         eff_channels = n_channels + len(FEATURE_NAMES)
@@ -877,20 +994,33 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
     strategy = tf.distribute.OneDeviceStrategy("GPU:0")
     with strategy.scope():
         # Loss selection respects FOCAL flag
-        if ONEHOT:
+        if ONEHOT and not TVERSKY:
             loss_fn = (CategoricalFocalCrossentropy(alpha=[0.25, 0.55], gamma=1.5, label_smoothing=0.0, from_logits=False)
                        if FOCAL else
                        CategoricalCrossentropy(from_logits=False))
-        else:
-            loss_fn = (BinaryFocalCrossentropy(alpha=0.55, gamma=2)
+        elif not TVERSKY:
+            loss_fn = (BinaryFocalCrossentropy(alpha=0.75, gamma=3)
                        if FOCAL else
                        BinaryCrossentropy(from_logits=False))
+        else:
+            print("Tversky")
+            loss_fn = Tversky(alpha=0.5, beta=0.5)
         optimizer = tf.keras.optimizers.AdamW(
             learning_rate=lr_schedule,
             weight_decay=1e-3,
             use_ema=True,
             ema_momentum=0.999,
             ema_overwrite_frequency=None
+        )
+        common_kwargs = dict(
+            feat_input_dim=feat_input_dim if (FEATURES_AS_VECTOR and WINDOW_MODE.startswith('soft') or WINDOW_MODE=='features') and not TIME_STEP else None,
+            koopman_latent_dim=KOOPMAN_LATENT_DIM,
+            koopman_loss_weight=KOOPMAN_LOSS_WEIGHT,
+            use_reconstruction_head=USE_RECONSTRUCTION_HEAD,
+            recon_weight=RECON_WEIGHT,
+            recon_target=RECON_TARGET,
+            bottleneck_dim=BOTTLENECK_DIM,
+            expand_dim=EXPAND_DIM,
         )
 
         # Build model inside strategy scope
@@ -918,33 +1048,33 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                     model = build_transformer(
                         input_shape=(n_timepoints, eff_channels),
                         num_classes=NUM_CLASSES,
-                        time_step_classification=TIME_STEP,
-                        one_hot=ONEHOT,
-                        # hpc=HPC,
-                        use_se=USE_SE,
                         embed_dim=EMBED_DIMENSION,
                         num_layers=TRANS_LAYERS,
                         num_heads=ATTENTION_HEADS,
                         mlp_dim=MLP_DIMENSION,
                         dropout_rate=DROPOUT_RATE,
+                        time_step_classification=TIME_STEP,
+                        one_hot=ONEHOT,
+                        use_se=USE_SE,
                         se_ratio=SE_RATIO,
+                        **common_kwargs,
                     )
                 case _:
                     model = build_tcn(
                         input_shape=(n_timepoints, eff_channels),
-                        num_filters=TCN_FILTERS,
-                        dropout_rate=DROPOUT_RATE,
                         num_classes=NUM_CLASSES,
+                        num_filters=TCN_FILTERS,
                         kernel_size=TCN_KERNEL_SIZE,
+                        dropout_rate=DROPOUT_RATE,
                         num_blocks=TCN_BLOCKS,
                         time_step_classification=TIME_STEP,
                         one_hot=ONEHOT,
                         hpc=HPC,
                         separable=False,
-                        feat_input_dim=feat_input_dim,
+                        se_ratio=SE_RATIO,
                         cycle_dilations=(1,2,4,8),
                         use_attention_pool_win=True,
-                        se_ratio=SE_RATIO,
+                        **common_kwargs,
                     )
 
         # Print receptive field info for TCN-like models
@@ -1087,13 +1217,13 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
         )
 
         # # keep this only if you compiled with tf.keras.metrics.AUC(curve="PR", name="pr_auc")
-        # best_by_pr_auc_ckpt = tf.keras.callbacks.ModelCheckpoint(
-        #     filepath=str(RUN_DIR / "best_by_pr_auc.keras"),
-        #     monitor="val_pr_auc",         # from model.evaluate on validation_data
-        #     mode="max",
-        #     save_best_only=True,
-        #     verbose=1
-        # )
+    best_by_pr_auc_ckpt = tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(RUN_DIR / "best_by_pr_auc.keras"),
+            monitor="val_pr_auc",         # from model.evaluate on validation_data
+            mode="max",
+            save_best_only=True,
+            verbose=1
+        )
 
     # per-epoch weights for forensic/ablations (doesn't select, just saves) – avoid formatting with unknown metrics
     per_epoch_weights = tf.keras.callbacks.ModelCheckpoint(
@@ -1110,7 +1240,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
         # Option B: stop by frame recall (if you still prefer frame-level behavior)
     earlystop_frame = tf.keras.callbacks.EarlyStopping(
             monitor="val_pr_auc",
-            mode="max",
+            mode="min",
             patience=15,
             min_delta=1e-4,
             restore_best_weights=True,
@@ -1212,7 +1342,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
 
 if __name__ == "__main__":
     # Example usage
-    data_root = 'DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3'
+    data_root = '../DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3'
     tn_timepoints = int(WINDOW_SEC * PREPROCESS['resample'])
     print(tn_timepoints)
     model, history = pipeline(data_root, n_timepoints=tn_timepoints, n_channels=22, write_ds=WRITE, limits=LIMITS)
