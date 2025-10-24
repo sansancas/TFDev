@@ -47,12 +47,15 @@ def rotary_embedding(q, k):
     T = K.shape(q)[-2]
     dim = hd
 
-    pos = K.arange(T)                          # (T,)
+    dtype = q.dtype
+    pos = K.cast(K.arange(T), dtype)
     pos = K.reshape(pos, (1, 1, T, 1))         # (1,1,T,1)
-    idx = K.arange(dim // 2)
+    idx = K.cast(K.arange(dim // 2), dtype)
     idx = K.reshape(idx, (1, 1, 1, -1))        # (1,1,1,Hd/2)
 
-    inv_freq = 1.0 / (10000.0 ** (idx / (dim / 2.0)))  # (1,1,1,Hd/2)
+    base = K.cast(10000.0, dtype)
+    half_dim = K.cast(dim / 2.0, dtype)
+    inv_freq = K.divide(K.cast(1.0, dtype), K.power(base, idx / half_dim))  # (1,1,1,Hd/2)
     angles = pos * inv_freq                              # (1,1,T,Hd/2)
     sin = K.sin(angles)
     cos = K.cos(angles)
@@ -226,6 +229,11 @@ def build_transformer(
     # ===== NUEVO: Bottleneck / Expansión =====
     bottleneck_dim: int | None = None,
     expand_dim: int | None = None,
+    # ===== NUEVO: Domain/context =====
+    domain_num_buckets: int | None = None,
+    domain_embed_dim: int = 32,
+    domain_input_dtype: str = "int32",
+    context_dropout: float = 0.0,
 ):
     inp = layers.Input(shape=input_shape, name="input")
     x = inp
@@ -250,17 +258,54 @@ def build_transformer(
     # Token [CLS] como capa
     x = AddCLSToken(embed_dim, name="cls")(x)
 
-    # Features contextuales vía FiLM (opcional)
+    # --- Contexto adicional (features y/o dominio) ---
+    context_inputs = []
+    context_tensors = []
     feat_inp = None
     if feat_input_dim is not None and feat_input_dim > 0:
         feat_inp = layers.Input(shape=(feat_input_dim,), name="feat_input")
-        x = FiLM1D(channels=embed_dim, name="film0")(x, feat_inp)
+        context_inputs.append(feat_inp)
+        context_tensors.append(feat_inp)
+
+    domain_inp = None
+    if (not time_step_classification) and domain_num_buckets is not None and domain_num_buckets > 0:
+        dtype = tf.dtypes.as_dtype(domain_input_dtype)
+        domain_inp = layers.Input(shape=(), dtype=dtype, name="domain_input")
+        if dtype == tf.string:
+            domain_ids = layers.Lambda(
+                lambda d: tf.strings.to_hash_bucket_fast(d, num_buckets=domain_num_buckets),
+                name="domain_hash"
+            )(domain_inp)
+        else:
+            domain_ids = layers.Lambda(lambda d: tf.cast(d, tf.int32), name="domain_cast")(domain_inp)
+        domain_ids = layers.Lambda(
+            lambda d: tf.math.mod(tf.cast(d, tf.int32), domain_num_buckets),
+            name="domain_bucket"
+        )(domain_ids)
+        domain_emb = layers.Embedding(domain_num_buckets, domain_embed_dim, name="domain_embedding")(domain_ids)
+        context_inputs.append(domain_inp)
+        context_tensors.append(domain_emb)
+
+    context_tensor = None
+    if context_tensors:
+        context_tensor = context_tensors[0] if len(context_tensors) == 1 else layers.Concatenate(name="context_concat")(context_tensors)
+        if context_dropout and context_dropout > 0.0:
+            context_tensor = layers.Dropout(context_dropout, name="context_dropout")(context_tensor)
+
+    def apply_film(tensor, name):
+        if context_tensor is None:
+            return tensor
+        channels = tensor.shape[-1]
+        if channels is None:
+            raise ValueError(f"FiLM '{name}' requiere canal estático")
+        return FiLM1D(int(channels), name=name)(tensor, context_tensor)
+
+    x = apply_film(x, "film0")
 
     # Pila Transformer con RoPE (+FiLM opcional)
     for i in range(num_layers):
         x = transformer_block_rope(x, embed_dim, num_heads, mlp_dim, dropout_rate, name=f"encoder{i+1}")
-        if feat_inp is not None:
-            x = FiLM1D(embed_dim, name=f"film{i+1}")(x, feat_inp)
+        x = apply_film(x, f"film{i+1}")
         if use_se and i in (0, num_layers-1):
             x = se_block_1d(x, se_ratio=se_ratio, name=f"se_enc_{i+1}")
 
@@ -280,9 +325,9 @@ def build_transformer(
         A = layers.Dense(koopman_latent_dim, use_bias=False, name="koop_A")
         z_pred = A(z_t)
         diff = layers.Subtract(name="koop_diff")([z_tp, z_pred])
+        _ = AddScalarMSELoss(koopman_loss_weight, name="koop_loss")(diff)
         # koop_mse = layers.Lambda(lambda d: tf.reduce_mean(tf.square(d)), name="koop_mse")(diff)
         # koop_weighted = layers.Lambda(lambda v: v * koopman_loss_weight, name="koop_weight")(koop_mse)
-        _ = AddScalarMSELoss(koopman_loss_weight, name="koop_loss")(diff)
 
     # ===== Reconstrucción (autoencoder ligero) =====
     recon_weighted = None
@@ -295,7 +340,7 @@ def build_transformer(
         rdiff = layers.Subtract(name="recon_diff")([proj_in, x_rec])
         # r_mse = layers.Lambda(lambda d: tf.reduce_mean(tf.square(d)), name="recon_mse")(rdiff)
         # recon_weighted = layers.Lambda(lambda v: v * recon_weight, name="recon_weight")(r_mse)
-        _ = AddScalarMSELoss(koopman_loss_weight, name="recon_loss")(rdiff)
+        _ = AddScalarMSELoss(recon_weight, name="recon_loss")(rdiff)
 
     # --- Cabezas ---
     if time_step_classification:
@@ -306,17 +351,21 @@ def build_transformer(
             x_frames = layers.Dense(bottleneck_dim, activation=gelu, name="bneck_ts")(x_frames)
             if expand_dim:
                 x_frames = layers.Dense(expand_dim, activation=gelu, name="expand_ts")(x_frames)
+        x_frames = apply_film(x_frames, "film_ts")
         logits = layers.Dense(num_classes, name="fc_frames")(x_frames)
         if one_hot:
             out = layers.Softmax(name="softmax_ts")(logits)
         else:
-            out = layers.Dense(1, activation='sigmoid', name='sigmoid_ts')(logits)
+            out = layers.Activation('sigmoid', name='sigmoid_ts')(logits)
     else:
         cls_token = layers.Lambda(lambda t: t[:, 0, :],  name="pick_cls")(x)
         body      = layers.Lambda(lambda t: t[:, 1:, :], name="pick_body")(x)
         attn_pool = AttentionPooling1D(name="attnpool")(body)
         h = layers.Concatenate(name="win_head_concat")([cls_token, attn_pool])
         h = layers.Dropout(dropout_rate, name="win_head_drop")(h)
+        if context_tensor is not None:
+            context_proj = layers.Dense(embed_dim, activation=gelu, name="context_proj_win")(context_tensor)
+            h = layers.Concatenate(name="win_head_context_concat")([h, context_proj])
         # Bottleneck/expansión opcional
         if bottleneck_dim:
             h = layers.Dense(bottleneck_dim, activation=gelu, name="bneck_win")(h)
@@ -328,7 +377,14 @@ def build_transformer(
         else:
             out = layers.Dense(1, activation='sigmoid', name='sigmoid_win')(logits)
 
-    inputs = [inp] if feat_inp is None else [inp, feat_inp]
+    inputs = [inp]
+    inputs.extend(context_inputs)
     model = models.Model(inputs=inputs, outputs=out, name="eeg_transformer_rope_film")
+
+    # Registrar pérdidas auxiliares
+    # if koop_weighted is not None:
+    #     model.add_loss(koop_weighted)
+    # if recon_weighted is not None:
+    #     model.add_loss(recon_weighted)
 
     return model

@@ -17,7 +17,12 @@ from tensorflow.keras import layers, models
 from tensorflow.keras import backend as K
 import absl.logging as absl
 from tqdm.keras import TqdmCallback
-from dataset import create_dataset_final_v2, write_tfrecord_splits_FINAL_CORRECTED, DEFAULT_EEG_FEATURES
+from dataset import (
+    create_dataset_final_v2,
+    write_tfrecord_splits_FINAL_CORRECTED,
+    DEFAULT_EEG_FEATURES,
+    _DMD_NAMES,
+)
 
 ENABLE_XLA = True                    # Master flag for XLA/JIT compilation
 JIT_COMPILE_MODEL = False             # JIT compile individual model layers (model.compile jit_compile=)
@@ -42,7 +47,9 @@ USE_GRU = True
 USE_SE = True
 PREPROCESS = {
     'bandpass': (0.5, 40.),   # (low, high) Hz
-    'notch': 60.,             # Hz
+    'notch': 60.,             # Hz (base or list)
+    'notch_harmonics': True,
+    'n_harmonics': 2,
     'resample': 256,          # Hz target
 }
 WINDOW_SEC = 5.0             # Window length in seconds
@@ -78,9 +85,9 @@ RUN_DIR = RUNS_DIR / f"eeg_seizures_{RUN_STAMP}"
 MODEL = 'TCN'  
 # Use focal losses if True; otherwise standard cross-entropy losses
 FOCAL = True
-TVERSKY = False
+TVERSKY = True
 CLASS_WEIGHTS = False
-BALANCED_STREAM = None #0.2
+BALANCED_STREAM = 0.2
 
 # Dataset window mode configuration:
 # - "default": hard window label
@@ -124,7 +131,7 @@ DOMAIN_TO_INT = True
 DOMAIN_NUM_BUCKETS = 4096
 INCLUDE_PATIENTS = None # e.g., [b"pt_001", b"pt_002"]
 EXCLUDE_PATIENTS = None # e.g., [b"heldout_pt"]
-USE_DOMAIN_INPUT_IN_MODEL = True
+
 
 # ===================== Model hyperparams =====================
 TCN_KERNEL_SIZE = 7
@@ -149,7 +156,7 @@ KOOPMAN_LOSS_WEIGHT = 0.1
 USE_RECONSTRUCTION_HEAD = True
 RECON_WEIGHT = 0.05
 RECON_TARGET = "signal" # for Transformer we reconstruct projection embedding
-BOTTLENECK_DIM = 128 #128
+BOTTLENECK_DIM = 128
 EXPAND_DIM = 256
 # ---------------------- Run configuration snapshot ----------------------
 def save_run_config(run_dir: Path, extra: dict | None = None):
@@ -210,6 +217,12 @@ def save_run_config(run_dir: Path, extra: dict | None = None):
     if extra:
         cfg.update(extra)
     run_dir.mkdir(parents=True, exist_ok=True)
+        # add a stable hash of PREPROCESS for traceability
+    try:
+        import hashlib
+        cfg['PREPROCESS_HASH'] = hashlib.sha256(json.dumps(PREPROCESS, sort_keys=True).encode()).hexdigest()[:16]
+    except Exception:
+        pass
     with open(run_dir / "run_config.json", "w") as f:
         json.dump(cfg, f, indent=2)
 
@@ -787,34 +800,6 @@ def inspect_dataset(ds: tf.data.Dataset, num_batches: int | None = 3, positive_l
     prev = (total_pos / total_items) if total_items else 0.0
     print(f"\nTotal: {total_pos}/{total_items} positives → {prev:.2%} prevalence")
 
-def _flatten_inputs(inputs):
-    return tf.nest.flatten(inputs)
-
-
-def autodetect_feat_dim_from_dataset(ds):
-    """Peek one element of `ds` and return (feat_dim_or_None, has_domain_bool).
-    - EEG is assumed to be rank-3 (B,T,C)
-    - Feature vector is rank-2 (B,F)
-    - Domain id is rank-1 (B,)
-    This function performs NO mapping; it only reads shapes.
-    """
-    if ds is None:
-        return None, False
-    for elem in ds.take(1):
-        # elem can be (inputs, y) or ((inputs...), y)
-        if isinstance(elem, (tuple, list)) and len(elem) == 2:
-            inputs, _ = elem
-        else:
-            # unexpected, just bail out gracefully
-            return None, False
-        flat = _flatten_inputs(inputs)
-        eeg = next((t for t in flat if getattr(t, 'shape', None) is not None and len(t.shape) == 3), None)
-        feats = next((t for t in flat if getattr(t, 'shape', None) is not None and len(t.shape) == 2), None)
-        domain = next((t for t in flat if getattr(t, 'shape', None) is not None and len(t.shape) == 1), None)
-        feat_dim = int(feats.shape[-1]) if feats is not None and feats.shape.rank == 2 else None
-        return feat_dim, (domain is not None)
-    return None, False
-
 def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write_ds=True, limits=None):
 
     if write_ds:
@@ -848,6 +833,8 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
     train_paths = train_files
     val_paths   = val_files
 
+    use_domain_input = RETURN_DOMAIN_ID and MODEL == 'TRANS' and not TIME_STEP
+
     def _make_train_ds(paths):
         return create_dataset_final_v2(
             train_paths,
@@ -868,16 +855,17 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
             prefetch=True,
             balance_strategy='undersample' if BALANCED_STREAM else 'none',
             enable_dmd_features=ENABLE_DMD_FEATURES,
+            use_precomputed_dmd=True,
+            normalize_mode='window',
             dmd_n_modes=DMD_OPTS.get('n_modes', 8),
             dmd_subsample=DMD_OPTS.get('subsample', 2),
-            return_domain_id=RETURN_DOMAIN_ID,
+            return_domain_id=use_domain_input,
             domain_from=DOMAIN_FROM,
             domain_to_int=DOMAIN_TO_INT,
             domain_num_buckets=DOMAIN_NUM_BUCKETS,
             include_patients=INCLUDE_PATIENTS,
             exclude_patients=EXCLUDE_PATIENTS,
             balance_pos_frac=BALANCED_STREAM if BALANCED_STREAM else None,
-            use_domain_in_output=False,
         
         )
     def _make_count_ds(paths):
@@ -901,16 +889,17 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
             prefetch=False,
             balance_strategy='undersample' if BALANCED_STREAM else 'none',
             enable_dmd_features=ENABLE_DMD_FEATURES,
+            use_precomputed_dmd=True,
+            normalize_mode='window',
             dmd_n_modes=DMD_OPTS.get('n_modes', 8),
             dmd_subsample=DMD_OPTS.get('subsample', 2),
-            return_domain_id=RETURN_DOMAIN_ID,
+            return_domain_id=use_domain_input,
             domain_from=DOMAIN_FROM,
             domain_to_int=DOMAIN_TO_INT,
             domain_num_buckets=DOMAIN_NUM_BUCKETS,
             include_patients=INCLUDE_PATIENTS,
             exclude_patients=EXCLUDE_PATIENTS,
-            balance_pos_frac=None,
-            use_domain_in_output=False,
+            balance_pos_frac=BALANCED_STREAM if BALANCED_STREAM else None,
         )
     # Count steps safely (cardinality may be UNKNOWN due to flat_map)
     _count_ds = _make_count_ds(train_paths)
@@ -958,31 +947,37 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
             prefetch=True,
             balance_strategy='undersample' if BALANCED_STREAM else 'none',
             enable_dmd_features=ENABLE_DMD_FEATURES,
+            use_precomputed_dmd=True,
+            normalize_mode='window',
             dmd_n_modes=DMD_OPTS.get('n_modes', 8),
             dmd_subsample=DMD_OPTS.get('subsample', 2),
-            return_domain_id=RETURN_DOMAIN_ID,
+            return_domain_id=use_domain_input,
             domain_from=DOMAIN_FROM,
             domain_to_int=DOMAIN_TO_INT,
             domain_num_buckets=DOMAIN_NUM_BUCKETS,
             include_patients=INCLUDE_PATIENTS,
             exclude_patients=EXCLUDE_PATIENTS,
             balance_pos_frac=None,
-            use_domain_in_output=False,
     )
 
     inspect_dataset(_count_ds, num_batches=1000)
-    
     inspect_dataset(val_ds, num_batches=1000)
 
-    feat_dim_detected, had_domain = autodetect_feat_dim_from_dataset(train_ds)
-
-    # Compute effective input channels and whether we have a separate features vector
+    # Compute effective input channels and feature-vector dimensions
+    ff_modes = {"features", "soft_features", "soft+features"}
+    use_feat_vec = FEATURES_AS_VECTOR and (WINDOW_MODE in ff_modes) and not TIME_STEP
     eff_channels = n_channels
-    use_feat_vec = (FEATURES_AS_VECTOR and WINDOW_MODE == "features" and not TIME_STEP)
-    feat_input_dim = feat_input_dim = int(feat_dim_detected) if feat_dim_detected is not None else None
-    if WINDOW_MODE == "features" and not TIME_STEP and not FEATURES_AS_VECTOR:
-        # concatenated to channels per time step
+    if not use_feat_vec and (WINDOW_MODE in ff_modes):
+        # Features concatenated per time step
         eff_channels = n_channels + len(FEATURE_NAMES)
+
+    feat_input_dim = None
+    if use_feat_vec:
+        feat_input_dim = len(FEATURE_NAMES)
+        if ENABLE_DMD_FEATURES:
+            feat_input_dim += len(_DMD_NAMES)
+        if INCLUDE_LABEL_FEATS:
+            feat_input_dim += 2
 
     if CLASS_WEIGHTS:
         class_weight = estimate_class_weight(_count_ds, onehot=ONEHOT, time_step=TIME_STEP, max_batches=100)
@@ -999,7 +994,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                        if FOCAL else
                        CategoricalCrossentropy(from_logits=False))
         elif not TVERSKY:
-            loss_fn = (BinaryFocalCrossentropy(alpha=0.75, gamma=3)
+            loss_fn = (BinaryFocalCrossentropy(alpha=0.55, gamma=3)
                        if FOCAL else
                        BinaryCrossentropy(from_logits=False))
         else:
@@ -1013,7 +1008,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
             ema_overwrite_frequency=None
         )
         common_kwargs = dict(
-            feat_input_dim=feat_input_dim if (FEATURES_AS_VECTOR and WINDOW_MODE.startswith('soft') or WINDOW_MODE=='features') and not TIME_STEP else None,
+            feat_input_dim=feat_input_dim,
             koopman_latent_dim=KOOPMAN_LATENT_DIM,
             koopman_loss_weight=KOOPMAN_LOSS_WEIGHT,
             use_reconstruction_head=USE_RECONSTRUCTION_HEAD,
@@ -1057,6 +1052,9 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                         one_hot=ONEHOT,
                         use_se=USE_SE,
                         se_ratio=SE_RATIO,
+                        domain_num_buckets=DOMAIN_NUM_BUCKETS if (RETURN_DOMAIN_ID and not TIME_STEP) else None,
+                        domain_input_dtype="int32",
+                        context_dropout=DROPOUT_RATE if feat_input_dim else 0.0,
                         **common_kwargs,
                     )
                 case _:

@@ -2,17 +2,25 @@ import os
 import gc
 import glob
 import numpy as np
+import numpy as _np
+from sklearn import base
 import tensorflow as tf
 import mne
 from typing import Optional, Dict
 import pandas as pd
 import time
+try:
+    import tensorflow_probability as tfp
+except Exception:
+    tfp = None
 
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
 PREPROCESS = {
     'bandpass': (0.5, 40.),   # (low, high) Hz
-    'notch': 60.,             # Hz
+    'notch': 60.,             # Hz (base or list)
+    'notch_harmonics': True,
+    'n_harmonics': 2,
     'resample': 256,          # Hz target
 }
 
@@ -53,6 +61,26 @@ DEFAULT_EEG_FEATURES = list(ALL_EEG_FEATURES)
 # =================================================================================================================
 # Montage-based CSV listing & filtering
 # =================================================================================================================
+
+def detect_suffix_strict(ch_names):
+    """Detect channel name suffix across all channels robustly.
+    Returns '-LE' if majority end with '-LE', '-REF' if majority '-REF',
+    otherwise tries to infer by presence of canonical names.
+   """
+    le = sum(1 for ch in ch_names if ch.endswith('-LE'))
+    rf = sum(1 for ch in ch_names if ch.endswith('-REF'))
+    if le > rf and le > 0:
+        return '-LE'
+    if rf > le and rf > 0:
+        return '-REF'
+    # fallback: look for canonical bipolar references
+    for suf in ('-LE','-REF'):
+        for base in ('F7','F8','T3','T4','T5','T6','C3','C4','P3','P4','O1','O2'):
+            if any(ch == base + suf for ch in ch_names):
+                return suf
+    # default to -REF if unknown
+    return '-REF'
+
 def filter_by_montage(paths, montage_type: str):
     """
     Keep only CSV or EDF paths whose directory indicates the desired montage.
@@ -93,6 +121,18 @@ MONTAGE_PAIRS = {
     ]
 }
 
+
+def _notch_freqs_from_cfg(cfg):
+    notch = cfg.get('notch', None)
+    if notch in (None, 0, False):
+        return None
+    if isinstance(notch, (list, tuple)):
+        return [float(f) for f in notch if f]
+    base = float(notch)
+    n_h = int(cfg.get('n_harmonics', 0)) if cfg.get('notch_harmonics', False) else 0
+    return [base * (i+1) for i in range(n_h + 1)]
+
+
 def preprocess_edf(raw, config=PREPROCESS):
     """
     Optimized preprocessing function with better memory management and early returns.
@@ -105,24 +145,18 @@ def preprocess_edf(raw, config=PREPROCESS):
     
     # Apply filters before resampling to avoid aliasing
     if BANDPASS:
-        raw.filter(
-            config['bandpass'][0],
-            config['bandpass'][1],
-            method='iir',
-            iir_params={'order': 4, 'ftype': 'butter'},
-            phase='zero',
-            verbose=False
-        )
+        raw.filter(config['bandpass'][0], config['bandpass'][1], method='fir', phase='zero', verbose=False)
     
     if NOTCH:
-        raw.notch_filter(
-            freqs=config['notch'],
-            method='iir',
-            iir_params={'order': 2, 'ftype': 'butter'},
-            phase='zero',
-            verbose=False
-        )
-    
+        freqs = _notch_freqs_from_cfg(config)
+        if freqs:
+            raw.notch_filter(
+                freqs=freqs,
+                method='fir',
+                phase='zero',
+                verbose=False
+            )
+
     # Resample after filtering
     if config.get('resample', 0) and config['resample'] != raw.info['sfreq']:
         raw.resample(config['resample'], npad='auto', verbose=False)
@@ -152,7 +186,7 @@ def extract_montage_signals(edf_path: str, montage: str='ar', desired_fs: int=0)
     
     # Determine suffix efficiently
     ch_names_set = set(raw.ch_names)
-    suf = '-LE' if any(ch.endswith('-LE') for ch in raw.ch_names[:10]) else '-REF'  # Check only first 10
+    suf = detect_suffix_strict(raw.ch_names)
     
     # Build pairs with suffix
     pairs = [(f'EEG {a}{suf}', f'EEG {b}{suf}') for a, b in MONTAGE_PAIRS[montage]]
@@ -242,7 +276,8 @@ def serialize_example(eeg_flat, labels_flat, *,
                       sfreq: Optional[float] = None,
                       start_tp: Optional[int] = None,
                       hop_tp: Optional[int] = None,
-                      writer_version: Optional[str] = None):
+                      writer_version: Optional[str] = None,
+                      dmd_features: Optional[np.ndarray] = None):
     """
     Optimized serialization with pre-encoded strings and efficient feature creation.
     """
@@ -276,6 +311,13 @@ def serialize_example(eeg_flat, labels_flat, *,
     if writer_version is not None:
         features["writer_version"] = _bytes_feature(writer_version.encode("utf-8"))
 
+
+    if dmd_features is not None:
+        try:
+            dmd_f = np.asarray(dmd_features, dtype=np.float32).ravel()
+            features['dmd_features'] = tf.train.Feature(float_list=tf.train.FloatList(value=dmd_f.tolist()))
+        except Exception:
+            pass
     example = tf.train.Example(features=tf.train.Features(feature=features))
     return example.SerializeToString()
 
@@ -286,6 +328,7 @@ _BASE_FEATURE_DESC = {
     'patient_id': tf.io.FixedLenFeature([], tf.string, default_value=b''),
     'record_id': tf.io.FixedLenFeature([], tf.string, default_value=b''),
     'duration_sec': tf.io.FixedLenFeature([], tf.float32, default_value=0.0),
+    'dmd_features': tf.io.VarLenFeature(tf.float32),
 }
 
 def parse_example(
@@ -442,7 +485,7 @@ def _dmd_feats_tf(eeg_tc: tf.Tensor, n_modes: int, subsample: int | None) -> tf.
 # --- al inicio de dataset.py (o en un bloque de constantes) ---
 WINDOW_FEATURES_DIM = 6  # número fijo de features agregadas por ventana en 'features' mode
 
-def _compute_dmd_features_np(x_win: np.ndarray, n_modes: int = 8, subsample: int | None = None) -> np.ndarray:
+def _compute_dmd_features_np(x_win: _np.ndarray, n_modes: int = 8, subsample: int | None = None) -> _np.ndarray:
     """
     x_win: ventana (T, C) en float32/float64.
     Devuelve vector float32 con len(_DMD_NAMES).
@@ -453,7 +496,7 @@ def _compute_dmd_features_np(x_win: np.ndarray, n_modes: int = 8, subsample: int
             X = X[::subsample, :]
         T, C = X.shape
         if T < 5:
-            return np.array([0,0,0,0,0,1,0,0,0,0], dtype=np.float32)
+            return _np.array([0,0,0,0,0,1,0,0,0,0], dtype=_np.float32)
 
         X0 = X[:-1, :]
         X1 = X[1:, :]
@@ -461,48 +504,48 @@ def _compute_dmd_features_np(x_win: np.ndarray, n_modes: int = 8, subsample: int
         X0c = X0 - mu
         X1c = X1 - mu
 
-        U, S, Vt = np.linalg.svd(X0c, full_matrices=False)
+        U, S, Vt = _np.linalg.svd(X0c, full_matrices=False)
         r = max(1, min(n_modes, (S > 1e-8).sum()))
         U_r = U[:, :r]
         S_r = S[:r]
         V_r = Vt[:r, :].T  # (C,r)
         A_tilde = (U_r.T @ X1c) @ (V_r / S_r)
-        evals, _ = np.linalg.eig(A_tilde)
-        mag = np.abs(evals)
+        evals, _ = _np.linalg.eig(A_tilde)
+        mag = _np.abs(evals)
 
         spectral_radius = mag.max() if mag.size else 0.0
-        mean_logmag = np.mean(np.log1p(mag)) if mag.size else 0.0
+        mean_logmag = _np.mean(_np.log1p(mag)) if mag.size else 0.0
         count_unstable = float((mag > 1.0).sum())
 
         if mag.sum() > 0:
-            p = (mag / mag.sum()).astype(np.float64)
-            p = np.clip(p, 1e-12, 1.0)
-            energy_entropy = float(-(p * np.log(p)).sum())
+            p = (mag / mag.sum()).astype(_np.float64)
+            p = _np.clip(p, 1e-12, 1.0)
+            energy_entropy = float(-(p * _np.log(p)).sum())
             k = min(3, p.size)
-            energy_topk = float(np.sort(p)[-k:].sum())
+            energy_topk = float(_np.sort(p)[-k:].sum())
         else:
             energy_entropy = 0.0
             energy_topk = 0.0
 
-        real = np.real(evals); imag = np.imag(evals)
+        real = _np.real(evals); imag = _np.imag(evals)
         real_mean = float(real.mean()) if evals.size else 0.0
         imag_mean = float(imag.mean()) if evals.size else 0.0
         real_std  = float(real.std())  if evals.size else 0.0
         imag_std  = float(imag.std())  if evals.size else 0.0
 
         # Recon error rápido
-        X1c_hat = (U_r @ A_tilde) @ (V_r.T * S_r[np.newaxis, :])
-        den = np.linalg.norm(X1c) + 1e-12
-        recon_relerr = float(np.linalg.norm(X1c - X1c_hat) / den)
+        X1c_hat = (U_r @ A_tilde) @ (V_r.T * S_r[_np.newaxis, :])
+        den = _np.linalg.norm(X1c) + 1e-12
+        recon_relerr = float(_np.linalg.norm(X1c - X1c_hat) / den)
 
-        out = np.array([
+        out = _np.array([
             spectral_radius, mean_logmag, count_unstable,
             energy_topk, energy_entropy, recon_relerr,
             real_mean, imag_mean, real_std, imag_std
-        ], dtype=np.float32)
+        ], dtype=_np.float32)
         return out
     except Exception:
-        return np.array([0,0,0,0,0,1,0,0,0,0], dtype=np.float32)
+        return _np.array([0,0,0,0,0,1,0,0,0,0], dtype=_np.float32)
 
 
 def _dmd_feats_tf(eeg_tc: tf.Tensor, n_modes: int, subsample: int | None) -> tf.Tensor:
@@ -519,7 +562,7 @@ def _dmd_feats_tf(eeg_tc: tf.Tensor, n_modes: int, subsample: int | None) -> tf.
 def create_dataset_final_v2(
     tfrecord_files, n_channels, n_timepoints, batch_size,
     one_hot=False, time_step=False, balance_pos_frac=None,
-    cache=False, drop_remainder=False, shuffle=False, shuffle_buffer=4096,
+    cache=False, drop_remainder=True, shuffle=False, shuffle_buffer=4096,
     window_mode="default",  # "default" | "soft" | "features" | "soft+features"
     include_label_feats=False,  # si True, añade y_soft y y_hard como features extra (solo inspección)
     sample_rate=None,           # Hz. Requerido para band-powers
@@ -527,7 +570,9 @@ def create_dataset_final_v2(
     return_feature_vector=False, # si True en modo 'features' devuelve (eeg, feats) sin replicar
     prefetch: bool = True,       # permite desactivar el prefetch interno para colocar repeat antes del prefetch final
     balance_strategy: str = 'none',  # 'rejection' | 'undersample' | 'none'
+    normalize_mode: str = 'record',  # 'record'|'window'|'robust'|'none'
     # ====== NUEVO: DMD y dominio ======
+    use_precomputed_dmd: bool = True,
     enable_dmd_features: bool = False,
     dmd_n_modes: int = 8,
     dmd_subsample: int | None = 2,
@@ -537,7 +582,6 @@ def create_dataset_final_v2(
     domain_num_buckets: int = 2048,          # tamaño del bucket hash
     include_patients: list[str] | None = None,   # filtra dataset por pacientes permitidos
     exclude_patients: list[str] | None = None,   # filtra dataset por pacientes excluidos
-    use_domain_in_output: bool = False,
 ):
     """Crea dataset final (X,y) con soporte de:
     - Modos de ventana: default | soft | features | soft+features
@@ -570,6 +614,7 @@ def create_dataset_final_v2(
         'patient_id': tf.io.FixedLenFeature([], tf.string, default_value=''),
         'record_id': tf.io.FixedLenFeature([], tf.string, default_value=''),
         'duration_sec': tf.io.FixedLenFeature([], tf.float32, default_value=0.0),
+        'dmd_features': tf.io.VarLenFeature(tf.float32),
     }
 
     # ---------- helpers ----------
@@ -744,11 +789,19 @@ def create_dataset_final_v2(
         labels_flat = tf.sparse.to_dense(parsed['labels'])
         pid = parsed['patient_id']
         rid = parsed['record_id']
+        if 'dmd_features' in parsed:
+            dmd_sparse = parsed['dmd_features']
+            dmd_dense = tf.sparse.to_dense(dmd_sparse)
+            dmd_feat = tf.reshape(tf.cast(dmd_dense, tf.float32), [-1])
+        else:
+            dmd_feat = tf.zeros([0], tf.float32)
+
         return {
             'eeg': eeg,
             'labels_flat': labels_flat,
             'patient_id': pid,
             'record_id': rid,
+            'dmd_features': dmd_feat
         }
 
     def _apply_patient_filter(rec):
@@ -769,7 +822,24 @@ def create_dataset_final_v2(
         labels_flat = rec['labels_flat']
         pid = rec['patient_id']
         rid = rec['record_id']
-
+        # normalize per requested mode (window/robust) — record-level already applied at write time
+        if normalize_mode in ('window','robust'):
+            x = eeg
+            if normalize_mode == 'window':
+                mean = tf.reduce_mean(x, axis=0, keepdims=True)
+                std = tf.math.reduce_std(x, axis=0, keepdims=True) + 1e-6
+                eeg = (x - mean) / std
+            else:
+                median = tfp.stats.percentile(x, 50.0, axis=0, interpolation='nearest', keepdims=True) if 'tfp' in globals() else tf.sort(x, axis=0)[tf.shape(x)[0]//2:tf.shape(x)[0]//2+1]
+                q25 = tfp.stats.percentile(x, 25.0, axis=0, interpolation='nearest', keepdims=True) if 'tfp' in globals() else tf.sort(x, axis=0)[tf.shape(x)[0]//4:tf.shape(x)[0]//4+1]
+                q75 = tfp.stats.percentile(x, 75.0, axis=0, interpolation='nearest', keepdims=True) if 'tfp' in globals() else tf.sort(x, axis=0)[3*tf.shape(x)[0]//4:3*tf.shape(x)[0]//4+1]
+                iqr = tf.maximum(q75 - q25, 1e-6)
+                eeg = (x - median) / iqr
+        # Optional per-window normalization at read time
+        if normalize_mode in ('window',):
+            mean = tf.reduce_mean(eeg, axis=0, keepdims=True)
+            std  = tf.math.reduce_std(eeg, axis=0, keepdims=True) + 1e-6
+            eeg = (eeg - mean) / std
         labels_T = _labels_to_vector_T(labels_flat)
 
         # y (time_step o ventana)
@@ -803,7 +873,14 @@ def create_dataset_final_v2(
         if window_mode in ("features", "soft_features", "soft+features"):
             feats = _compute_features_eeg(eeg, tf.cast(sample_rate, tf.float32), selected_features)  # (F_sel,)
             if enable_dmd_features:
-                dmd_vec = _dmd_feats_tf(eeg, n_modes=int(dmd_n_modes), subsample=dmd_subsample)
+                if use_precomputed_dmd:
+                    dmd_vec = tf.cast(rec.get('dmd_features', tf.zeros([0], tf.float32)), tf.float32)
+                    # if empty, fallback to compute
+                    dmd_vec = tf.cond(tf.size(dmd_vec) > 0,
+                                      lambda: dmd_vec,
+                                      lambda: _dmd_feats_tf(eeg, n_modes=int(dmd_n_modes), subsample=dmd_subsample))
+                else:
+                    dmd_vec = _dmd_feats_tf(eeg, n_modes=int(dmd_n_modes), subsample=dmd_subsample)
                 feats = tf.concat([feats, dmd_vec], axis=0)
             if include_label_feats:
                 label_feats = tf.stack([y_soft_f, tf.cast(y_hard_int, tf.float32)], axis=0)
@@ -820,14 +897,17 @@ def create_dataset_final_v2(
             X = eeg
 
         # Domain ID opcional
-        if return_domain_id and use_domain_in_output:
-            dom_raw = pid if domain_from == "patient" else rid
-            dom = tf.strings.to_hash_bucket_fast(dom_raw, num_buckets=domain_num_buckets) if domain_to_int else dom_raw
-            dom = tf.cast(dom, tf.int32) if domain_to_int else dom
-            if return_feature_vector and isinstance(X, tuple):
-                X = (X[0], X[1], dom)
+        if return_domain_id:
+            dom_raw = tf.where(tf.equal(domain_from, "patient"), pid, rid)
+            if domain_to_int:
+                dom_id = tf.strings.to_hash_bucket_fast(dom_raw, num_buckets=domain_num_buckets)
+                dom_id = tf.cast(dom_id, tf.int32)
             else:
-                X = (X, dom)
+                dom_id = dom_raw
+            if return_feature_vector and isinstance(X, tuple):
+                X = (X[0], X[1], dom_id)  # (eeg, feats, domain)
+            else:
+                X = (X, dom_id)          # (eeg(+feats), domain)
 
         return X, y
 
@@ -841,13 +921,6 @@ def create_dataset_final_v2(
 
     # Map a (X,y)
     ds = ds.map(_to_xy, num_parallel_calls=tf.data.AUTOTUNE)
-    
-    # def _drop(inputs, y):
-    #     eeg, feats, _ = inputs   # ((eeg, feats, domain), y) -> ((eeg, feats), y)
-    #     return (eeg, feats), y
-
-    # if return_domain_id:
-    #     ds = ds.map(_drop, num_parallel_calls=tf.data.AUTOTUNE)
 
     if cache:
         ds = ds.cache()
@@ -933,7 +1006,7 @@ def create_dataset_final_v2(
 # 🎯 PIPELINE DEFINITIVO CON FUNCIÓN CORREGIDA
 # =================================================================================================================
 
-WRITER_VERSION = "v2-floorceil-mask"
+WRITER_VERSION = "v3-fir-notches-preDMD"
 
 def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_size_mb, dataset_type,
                                         resample_fs=256, window_sec=10.0, hop_sec=5.0,
@@ -1251,7 +1324,7 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
             windows_written = 0
             serialize_errors = 0
             
-            with tf.io.TFRecordWriter(str(tfrecord_path)) as writer:
+            with tf.io.TFRecordWriter(str(tfrecord_path), options='ZLIB') as writer:
                 for i, (window_signal, window_labels_array) in enumerate(zip(windows_data, windows_labels)):
                     if window_signal.shape[1] != window_samples:
                         continue
@@ -1264,7 +1337,10 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                         # Preparar datos en el formato que espera serialize_example
                         eeg_flat = window_signal.astype(np.float32).flatten()
                         labels_flat = window_labels_array.astype(np.int64).flatten()
-                        
+                        try:
+                            dmd_vec = _dmd_feats_np(window_signal.T, n_modes=8, subsample=2)
+                        except Exception:
+                            dmd_vec = None
                         # Llamada con la signature EXACTA de tu función
                         example_bytes = serialize_example(
                             eeg_flat,
@@ -1277,7 +1353,8 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                             sfreq=float(sfreq),
                             start_tp=int(i * step_samples),
                             hop_tp=int(step_samples),
-                            writer_version=WRITER_VERSION
+                            writer_version=WRITER_VERSION,
+                            dmd_features=dmd_vec
                         )
                         
                         # ✅ serialize_example YA RETORNA BYTES - no necesita .SerializeToString()
@@ -1347,7 +1424,6 @@ def process_single_file_FINAL_CORRECTED(csv_path, tfrecord_output_dir, chunk_siz
                         'windows_created': 0,
                         'tfrecord_files': []
                     }
-
             del signal_data, windows_data, windows_labels, labels_df, global_mask
             gc.collect()
             
