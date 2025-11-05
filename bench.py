@@ -31,6 +31,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 import tensorflow as tf
+from tensorflow.keras import mixed_precision
 from sklearn.metrics import (
 	accuracy_score,
 	balanced_accuracy_score,
@@ -44,53 +45,88 @@ from sklearn.metrics import (
 
 from dataset import create_dataset_final_v2
 
+mixed_precision.set_global_policy("mixed_float16")
+print("Global mixed precision policy set to mixed_float16.")
+
+try:
+	from keras import config as keras_config
+except ImportError:  # pragma: no cover
+	keras_config = None
+
+if keras_config is not None:
+	try:
+		keras_config.enable_unsafe_deserialization()
+		print("Unsafe deserialization enabled (trusted environment).")
+	except Exception:  # pragma: no cover - fallback if API missing
+		pass
+
 # ===================== Custom Model Loading Functions =====================
+
+def _collect_custom_objects() -> dict:
+	custom_objects: dict[str, object] = {}
+	try:
+		from models.Hybrid import FiLM1D as FiLM1D_Hybrid, AttentionPooling1D as AP1D_Hybrid
+		from models.TCN import FiLM1D as FiLM1D_TCN  # noqa: F401 (ensure import side-effects)
+		from models.Transformer import (
+			FiLM1D as FiLM1D_Trans,
+			MultiHeadSelfAttentionRoPE,
+			AttentionPooling1D as AP1D_Trans,
+			AddCLSToken,
+		)
+		custom_objects.update(
+			{
+				"FiLM1D": FiLM1D_Hybrid,
+				"AttentionPooling1D": AP1D_Hybrid,
+				"MultiHeadSelfAttentionRoPE": MultiHeadSelfAttentionRoPE,
+				"AddCLSToken": AddCLSToken,
+			}
+		)
+	except ImportError:
+		pass
+
+	try:
+		from models.Hybrid import FiLM1D as FiLM1D_Old_H, AttentionPooling1D as AP1D_Old_H
+	except ImportError:
+		FiLM1D_Old_H = None
+		AP1D_Old_H = None
+	try:
+		from models.TCN import FiLM1D as FiLM1D_Old_T  # noqa: F401
+	except ImportError:
+		FiLM1D_Old_T = None  # noqa: F841
+
+	if "FiLM1D" not in custom_objects and FiLM1D_Old_H is not None:
+		custom_objects["FiLM1D"] = FiLM1D_Old_H
+	if "AttentionPooling1D" not in custom_objects and AP1D_Old_H is not None:
+		custom_objects["AttentionPooling1D"] = AP1D_Old_H
+
+	for name, obj in custom_objects.items():
+		tf.keras.utils.get_custom_objects()[name] = obj
+
+	return custom_objects
+
 
 def load_model_with_custom_objects(model_path: str):
 	"""Load model providing custom objects for old models without decorators."""
+	custom_objects = _collect_custom_objects()
+	print(f"Loading with custom_objects: {list(custom_objects.keys())}")
 	try:
-		# Import custom classes - try both old and new locations
-		custom_objects = {}
-		
-		# Try importing from models (new location with decorators)
-		try:
-			from models.Hybrid import FiLM1D as FiLM1D_Hybrid, AttentionPooling1D as AP1D_Hybrid
-			from models.TCN import FiLM1D as FiLM1D_TCN
-			from models.Transformer import (
-				FiLM1D as FiLM1D_Trans, 
-				MultiHeadSelfAttentionRoPE, 
-				AttentionPooling1D as AP1D_Trans, 
-				AddCLSToken
-			)
-			custom_objects.update({
-				'FiLM1D': FiLM1D_Hybrid,
-				'AttentionPooling1D': AP1D_Hybrid,
-				'MultiHeadSelfAttentionRoPE': MultiHeadSelfAttentionRoPE,
-				'AddCLSToken': AddCLSToken,
-			})
-		except ImportError:
-			pass
-		
-		# Try importing from models (old location)
-		try:
-			from models.Hybrid import FiLM1D as FiLM1D_Old_H, AttentionPooling1D as AP1D_Old_H
-			from models.TCN import FiLM1D as FiLM1D_Old_T
-			if 'FiLM1D' not in custom_objects:
-				custom_objects['FiLM1D'] = FiLM1D_Old_H
-			if 'AttentionPooling1D' not in custom_objects:
-				custom_objects['AttentionPooling1D'] = AP1D_Old_H
-		except ImportError:
-			pass
-		
-		print(f"Loading with custom_objects: {list(custom_objects.keys())}")
+		return tf.keras.models.load_model(
+			model_path,
+			custom_objects=custom_objects,
+			compile=False,
+			safe_mode=False,
+		)
+	except TypeError:
 		return tf.keras.models.load_model(model_path, custom_objects=custom_objects, compile=False)
-		
-	except Exception as e:
-		print(f"Custom objects loading failed: {e}")
-		raise
 
 
-def load_weights_only_fallback(model_path: str, cfg: dict, n_channels: int, n_timepoints: int):
+def load_weights_only_fallback(
+	model_path: str,
+	cfg: dict,
+	n_channels: int,
+	n_timepoints: int,
+	feat_dim_override: Optional[int] = None,
+):
 	"""Fallback: reconstruct model architecture and load weights only."""
 	try:
 		# Convert to Path object for easier handling
@@ -99,6 +135,13 @@ def load_weights_only_fallback(model_path: str, cfg: dict, n_channels: int, n_ti
 		# Try to reconstruct model from config
 		model_type = cfg.get('MODEL', 'TCN')
 		
+		feat_input_dim = feat_dim_override
+		if feat_input_dim is None and cfg.get('FEATURES_AS_VECTOR', False):
+			feature_list = cfg.get('FEATURE_NAMES')
+			if feature_list:
+				feat_input_dim = len(feature_list)
+			elif isinstance(cfg.get('WINDOW_FEATURE_DIM'), (int, float)):
+				feat_input_dim = int(cfg['WINDOW_FEATURE_DIM'])
 		if model_type == 'TCN':
 			from models.TCN import build_tcn
 			model = build_tcn(
@@ -110,7 +153,7 @@ def load_weights_only_fallback(model_path: str, cfg: dict, n_channels: int, n_ti
 				one_hot=cfg.get('ONEHOT', False),
 				hpc=cfg.get('HPC', False),
 				separable=True,
-				feat_input_dim=len(cfg.get('FEATURE_NAMES', [])) if cfg.get('FEATURES_AS_VECTOR', False) else None,
+				feat_input_dim=feat_input_dim,
 			)
 		elif model_type == 'HYB':
 			from models.Hybrid import build_hybrid
@@ -119,7 +162,7 @@ def load_weights_only_fallback(model_path: str, cfg: dict, n_channels: int, n_ti
 				num_classes=2 if cfg.get('ONEHOT', False) else 1,
 				one_hot=cfg.get('ONEHOT', False),
 				time_step=cfg.get('TIME_STEP', False),
-				feat_input_dim=len(cfg.get('FEATURE_NAMES', [])) if cfg.get('FEATURES_AS_VECTOR', False) else None,
+				feat_input_dim=feat_input_dim,
 			)
 		elif model_type == 'TRANS':
 			from models.Transformer import build_transformer
@@ -192,7 +235,7 @@ def load_weights_only_fallback(model_path: str, cfg: dict, n_channels: int, n_ti
 RUN_DIR: Optional[str] = None  # e.g., "./runs/eeg_seizures_20250911-151631"
 
 # Option B: Point directly to a Keras model file or SavedModel directory
-MODEL_PATH: Optional[str] = 'runs/eeg_seizures_20250923-081338/pareto_auc_ep014.keras'  # e.g., "./runs/eeg_seizures_xxx/best.keras"
+MODEL_PATH: Optional[str] = 'runs/eeg_seizures_20251105-060128/pareto_auc_ep001.keras'  # e.g., "./runs/eeg_seizures_xxx/best.keras"
 
 # If RUN_DIR is None, we'll pick the most recent run under RUNS_DIR
 RUNS_DIR = Path("./runs")
@@ -288,7 +331,7 @@ def infer_shape_from_tfrecord(tfrecord_files: list[str], cfg: dict) -> Tuple[int
 		"n_timepoints": tf.io.FixedLenFeature([], tf.int64, default_value=0),
 	}
 	try:
-		ds = tf.data.TFRecordDataset(tfrecord_files[:1])
+		ds = tf.data.TFRecordDataset(tfrecord_files[:1], compression_type="ZLIB")
 		for raw in ds.take(1):
 			ex = tf.io.parse_single_example(raw, feat)
 			n_ch = int(ex["n_channels"].numpy())
@@ -329,9 +372,30 @@ def build_eval_dataset(cfg: dict, tfrecord_dir: Path, n_channels: int, n_timepoi
 		sample_rate=int(cfg.get("PREPROCESS", {}).get("resample", DEFAULTS["RESAMPLE_FS"])) ,
 		feature_names=cfg.get("FEATURE_NAMES", DEFAULTS["FEATURE_NAMES"]) ,
 		return_feature_vector=bool(cfg.get("FEATURES_AS_VECTOR", DEFAULTS["FEATURES_AS_VECTOR"])) ,
+		use_precomputed_dmd=bool(cfg.get("USE_PRECOMPUTED_DMD", cfg.get("ENABLE_DMD_FEATURES", False))),
+		enable_dmd_features=bool(cfg.get("ENABLE_DMD_FEATURES", False)),
+		dmd_n_modes=int(cfg.get("DMD_OPTS", {}).get("n_modes", 8)),
+		dmd_subsample=int(cfg.get("DMD_OPTS", {}).get("subsample", 2)) if cfg.get("DMD_OPTS") else 2,
 		prefetch=True,
 	)
 	return ds
+
+
+def infer_feature_vector_dim(ds: tf.data.Dataset) -> Optional[int]:
+	for batch in ds.take(1):
+		inputs, _ = batch
+		if isinstance(inputs, (tuple, list)) and len(inputs) >= 2:
+			feats = inputs[1]
+			if feats is None:
+				return None
+			feat_np = feats.numpy()
+			return int(feat_np.shape[-1])
+		if isinstance(inputs, dict):
+			for key in ("features", "feats", "feature_vector"):
+				if key in inputs:
+					feat_np = inputs[key].numpy()
+					return int(feat_np.shape[-1])
+	return None
 
 
 def ensure_dir(p: Path) -> Path:
@@ -605,20 +669,45 @@ def main():
 
 	# Build dataset
 	ds = build_eval_dataset(cfg, tfrecord_dir, n_channels, n_timepoints, batch_size)
+	feature_vector_dim = infer_feature_vector_dim(ds) if cfg.get("FEATURES_AS_VECTOR", DEFAULTS["FEATURES_AS_VECTOR"]) else None
+	if feature_vector_dim is not None:
+		print(f"Inferred feature vector dim: {feature_vector_dim}")
+
+	# Rebuild dataset to ensure full iteration after probing (tf.data datasets are re-iterable but regeneration is cheap)
+	ds = build_eval_dataset(cfg, tfrecord_dir, n_channels, n_timepoints, batch_size)
 
 	# Load model
 	print("Loading model…")
 	# Try multiple loading strategies for models with custom classes
 	model = None
+	custom_objects = _collect_custom_objects()
+
+	def _load_standard(path: Path):
+		try:
+			return tf.keras.models.load_model(
+				str(path),
+				compile=False,
+				custom_objects=custom_objects,
+				safe_mode=False,
+			)
+		except TypeError:
+			return tf.keras.models.load_model(str(path), compile=False, custom_objects=custom_objects)
+
 	loading_strategies = [
 		# Strategy 1: Standard loading (works with properly decorated models)
-		lambda: tf.keras.models.load_model(str(model_path), compile=False),
+		lambda: _load_standard(model_path),
 		
 		# Strategy 2: Load with custom objects (for older models without decorators)
 		lambda: load_model_with_custom_objects(str(model_path)),
 		
 		# Strategy 3: Load weights only (fallback method)
-		lambda: load_weights_only_fallback(str(model_path), cfg, n_channels, n_timepoints)
+		lambda: load_weights_only_fallback(
+			str(model_path),
+			cfg,
+			n_channels,
+			n_timepoints,
+			feat_dim_override=feature_vector_dim,
+		)
 	]
 	
 	for i, strategy in enumerate(loading_strategies, 1):
@@ -657,7 +746,7 @@ def main():
 
 	# Metrics
 	frame_hop_sec = float(cfg.get("FRAME_HOP_SEC", DEFAULTS["FRAME_HOP_SEC"]))
-	metrics = compute_metrics(y_true, y_prob, frame_hop_sec, threshold=0.2)
+	metrics = compute_metrics(y_true, y_prob, frame_hop_sec, threshold=chosen_thr)
 	print("Consolidated metrics:")
 	print(f"  - chosen_threshold: {chosen_thr:.4f}" + (" (auto)" if PREDICTION_THRESHOLD is None else " (fixed)"))
 	if PREDICTION_THRESHOLD is None:

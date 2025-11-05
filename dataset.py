@@ -20,7 +20,7 @@ PREPROCESS = {
     'bandpass': (0.5, 40.),   # (low, high) Hz
     'notch': 60.,             # Hz (base or list)
     'notch_harmonics': True,
-    'n_harmonics': 2,
+    'n_harmonics': 1,
     'resample': 256,          # Hz target
 }
 
@@ -912,7 +912,11 @@ def create_dataset_final_v2(
         return X, y
 
     # --------- dataset pipeline ---------
-    ds = tf.data.TFRecordDataset(tfrecord_files, num_parallel_reads=tf.data.AUTOTUNE)
+    ds = tf.data.TFRecordDataset(
+        tfrecord_files,
+        compression_type="ZLIB",
+        num_parallel_reads=tf.data.AUTOTUNE,
+    )
     ds = ds.map(_parse_raw, num_parallel_calls=tf.data.AUTOTUNE)
 
     # Filtro por paciente (si aplica)
@@ -1767,7 +1771,7 @@ def parse_tfrecord_with_metadata(serialized_example, n_channels, n_timepoints):
 def iterate_tfrecord_windows(tfrecord_path, n_channels, n_timepoints, limit=None):
     """Yield window dicts with metadata for a TFRecord file.
     If start_tp metadata is missing (legacy), infer using hop_tp and window index."""
-    ds = tf.data.TFRecordDataset([tfrecord_path])
+    ds = tf.data.TFRecordDataset([tfrecord_path], compression_type="ZLIB")
     count = 0
     for idx, raw in enumerate(ds):
         out = parse_tfrecord_with_metadata(raw, n_channels, n_timepoints)

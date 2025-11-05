@@ -24,9 +24,9 @@ from dataset import (
     _DMD_NAMES,
 )
 
-ENABLE_XLA = True                    # Master flag for XLA/JIT compilation
+ENABLE_XLA = False                    # Master flag for XLA/JIT compilation
 JIT_COMPILE_MODEL = False             # JIT compile individual model layers (model.compile jit_compile=)
-JIT_GLOBAL = True                    # Global TensorFlow XLA setting
+JIT_GLOBAL = False                    # Global TensorFlow XLA setting
 
 # Apply XLA settings
 if ENABLE_XLA and JIT_GLOBAL:
@@ -52,8 +52,8 @@ PREPROCESS = {
     'n_harmonics': 2,
     'resample': 256,          # Hz target
 }
-WINDOW_SEC = 5.0             # Window length in seconds
-BATCH_SIZE = 12
+WINDOW_SEC = 10.0             # Window length in seconds
+BATCH_SIZE = 16
 EPOCHS = 100
 USE_DROPOUT = True
 DROPOUT_RATE = 0.2
@@ -61,8 +61,8 @@ LEARNING_RATE = 2e-4
 MIN_LR_FRACTION = 0.05
 MIN_LR = LEARNING_RATE * MIN_LR_FRACTION
 WARMUP_RATIO = 0.1
-LIMITS={'train': 450, 'dev': 100, 'eval': 100}
-TIME_LIMIT_H = 48
+LIMITS={'train': 1000, 'dev': 200, 'eval': 200}
+TIME_LIMIT_H = 5
 FRAME_HOP_SEC = 2.5
 SWEEP=False
 HPC = False
@@ -73,7 +73,7 @@ NOTCH = True
 BANDPASS = True
 NORMALIZE = True
 NUM_CLASSES = 2  if ONEHOT else 1
-WRITE = True
+WRITE = False
 CUT = True
 FULL_REC = './records2' if ONEHOT else './bin_records2'
 CUT_REC = './records_cut2' if ONEHOT else './bin_records_cut2'
@@ -82,12 +82,12 @@ RUNS_DIR = Path("./runs")
 RUN_STAMP = datetime.now().strftime("%Y%m%d-%H%M%S")
 RUN_DIR = RUNS_DIR / f"eeg_seizures_{RUN_STAMP}"
 
-MODEL = 'TCN'  
+MODEL = 'HYB'  
 # Use focal losses if True; otherwise standard cross-entropy losses
 FOCAL = True
-TVERSKY = True
+TVERSKY = False
 CLASS_WEIGHTS = False
-BALANCED_STREAM = 0.2
+BALANCED_STREAM = 0.3
 
 # Dataset window mode configuration:
 # - "default": hard window label
@@ -726,7 +726,7 @@ class ParetoCheckpointMulti(tf.keras.callbacks.Callback):
 # Loss Functions
 # =================================================================================================================
 
-def focal_loss(gamma=2.0, alpha=0.25):
+def focal_loss(gamma=2.0, alpha=0.10):
     def loss_fn(y_true, y_pred):
         y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
         pt = tf.where(tf.equal(y_true, 1), y_pred, 1 - y_pred)
@@ -960,8 +960,8 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
             balance_pos_frac=None,
     )
 
-    inspect_dataset(_count_ds, num_batches=1000)
-    inspect_dataset(val_ds, num_batches=1000)
+    # inspect_dataset(_count_ds, num_batches=1000)
+    # inspect_dataset(val_ds, num_batches=1000)
 
     # Compute effective input channels and feature-vector dimensions
     ff_modes = {"features", "soft_features", "soft+features"}
@@ -994,7 +994,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
                        if FOCAL else
                        CategoricalCrossentropy(from_logits=False))
         elif not TVERSKY:
-            loss_fn = (BinaryFocalCrossentropy(alpha=0.55, gamma=3)
+            loss_fn = (BinaryFocalCrossentropy(alpha=0.90, gamma=3.5)
                        if FOCAL else
                        BinaryCrossentropy(from_logits=False))
         else:
@@ -1340,7 +1340,7 @@ def pipeline(data_dir: str, n_channels: int = 22, n_timepoints: int = 256, write
 
 if __name__ == "__main__":
     # Example usage
-    data_root = '../DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3'
+    data_root = 'DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3'
     tn_timepoints = int(WINDOW_SEC * PREPROCESS['resample'])
     print(tn_timepoints)
     model, history = pipeline(data_root, n_timepoints=tn_timepoints, n_channels=22, write_ds=WRITE, limits=LIMITS)
